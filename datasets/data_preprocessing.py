@@ -54,7 +54,7 @@ class Uniform15KPC(Dataset):
         self.all_cate_mids = []
         self.cate_idx_lst = []
         self.all_points = []
-        self.all_texts = []
+
         for cate_idx, subd in enumerate(self.subdirs):
             # NOTE: [subd] here is synset id
             sub_path = os.path.join(DATASET_PATH, subd, self.split)
@@ -82,11 +82,6 @@ class Uniform15KPC(Dataset):
                 self.all_points.append(point_cloud[np.newaxis, ...])
                 self.cate_idx_lst.append(cate_idx)
                 self.all_cate_mids.append((subd, mid))
-
-                # 查找文本描述
-                assert subd in self.text_annotations and mid.split("/")[1] in self.text_annotations[subd]
-                text_desc = self.text_annotations[subd][mid.split("/")[1]]  # 获取文本描述
-                self.all_texts.append(text_desc)
 
         # Shuffle the index deterministically (based on the number of examples)
         self.shuffle_idx = list(range(len(self.all_points)))
@@ -140,8 +135,6 @@ class Uniform15KPC(Dataset):
             m = self.all_points_mean[idx].reshape(1, self.input_dim)
             s = self.all_points_std[idx].reshape(1, -1)
             return m, s
-
-
         return self.all_points_mean.reshape(1, -1), self.all_points_std.reshape(1, -1)
 
     def renormalize(self, mean, std):
@@ -173,14 +166,17 @@ class Uniform15KPC(Dataset):
         m, s = self.get_pc_stats(idx)
         cate_idx = self.cate_idx_lst[idx]
         sid, mid = self.all_cate_mids[idx]
-        text_desc = self.all_texts[idx]
+        # 查找文本描述
+        assert sid in self.text_annotations and mid.split("/")[1] in self.text_annotations[sid]
+        text_desc = self.text_annotations[sid][mid.split("/")[1]]  # 获取文本描述
 
         out = {
             'idx': idx,
             'train_points': tr_out,
             'test_points': te_out,
             'mean': m, 'std': s, 'cate_idx': cate_idx,
-            'sid': sid, 'mid': mid,
+            'sid': sid, 
+            'mid': mid.split("/")[1],
             'text': text_desc
         }
 
