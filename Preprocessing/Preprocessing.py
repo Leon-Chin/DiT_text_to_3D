@@ -5,7 +5,7 @@ import numpy as np
 # 原始 ShapeNet 数据路径
 DATASET_DIR = "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/shapenet"
 # 目标存储路径
-N_POINTS = 1024
+N_POINTS = 5000
 OUTPUT_DIR = f"data_{N_POINTS}"
 # 设定每个点云的点数
 
