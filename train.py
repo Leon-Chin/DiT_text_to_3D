@@ -1,6 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
 import json
+
+import torch.version
 from datasets.data_preprocessing import ShapeNet15kPointClouds
 
 DATASET_PATH = "datasets/shapenet_data_5000_splitted"
@@ -42,11 +44,7 @@ def get_dit3d_model():
     #     input_size=voxel_size,
     #     num_classes=num_classes
     # )
-
-
-# -------------------------------------
-# 2. Diffusion 过程定义
-# -------------------------------------
+    
 class GaussianDiffusion:
     def __init__(self, betas, device, loss_type="mse"):
         self.loss_type = loss_type
@@ -70,9 +68,8 @@ class GaussianDiffusion:
         if noise is None:
             noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
-        print("x_noisy", x_noisy.shape)
         pred_noise = model(x_noisy, t, y)
-
+        assert pred_noise.shape == noise.shape
         if self.loss_type == "mse":
             return nn.functional.mse_loss(pred_noise, noise)
 
@@ -82,7 +79,7 @@ def train():
     # device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with open(RESULTS_JSON_PATH, "r") as f:
-            text_annotations = json.load(f)  # 加载 JSON 文件
+        text_annotations = json.load(f)  # 加载 JSON 文件
 
     train_dataset = ShapeNet15kPointClouds(categories=CATEGORY, split="train", text_annotations=text_annotations)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=WORKERS)
@@ -98,9 +95,7 @@ def train():
     # 训练循环
     for epoch in range(iteration_num):
         for i, data in enumerate(train_loader):
-            print(data["train_points"].shape)
             x = data["train_points"].transpose(1, 2).to(device)  # 形状: [B, 3, 2048]
-            print(x.shape)
             y = data["text"]#TODO
 
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)  # 随机时间步
@@ -116,9 +111,5 @@ def train():
         if (epoch + 1) % 100 == 0:
             torch.save(model.state_dict(), f"{checkpoints_dir}/dit3D_epoch{epoch}.pth")
 
-
-# -------------------------------------
-# 5. 运行训练
-# -------------------------------------
 if __name__ == "__main__":
     train()

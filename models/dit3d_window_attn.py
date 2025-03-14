@@ -2,19 +2,61 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
+import torch.nn.functional as F
 from timm.models.vision_transformer import Mlp
-
-from modules.voxelization import Voxelization
-# from modules.trilinear_devoxelize import trilinear_devoxelize
-import modules.functional as F
+from modules.myvoxelization import Voxelization
+from modules.trilinear_devoxelize import trilinear_devoxelize
 from models.text_encoder import ClipTextEncoder
-
-from models.utils_vit import *
-
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+def window_partition(x, window_size):
+    """
+    Partition into non-overlapping windows with padding if needed.
+    Args:
+        x (tensor): input tokens with [B, X, Y, Z, C].
+        window_size (int): window size.
+
+    Returns:
+        windows: windows after partition with [B * num_windows, window_size, window_size, window_size, C].
+        (Xp, Yp, Zp): padded height and width before partition
+    """
+    B, X, Y, Z, C = x.shape
+    # print(x.shape)
+    pad_x = (window_size - X % window_size) % window_size
+    pad_y = (window_size - Y % window_size) % window_size
+    pad_z = (window_size - Z % window_size) % window_size
+    if pad_x > 0 or pad_y > 0 or pad_z > 0:
+        x = F.pad(x, (0, 0, 0, pad_x, 0, pad_y))
+
+    Xp, Yp, Zp = X + pad_x, Y + pad_y, Z + pad_z
+
+    x = x.view(B, Xp // window_size, window_size, Yp // window_size, window_size, Zp // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, window_size, window_size, window_size, C)
+    return windows, (Xp, Yp, Zp)
+
+def window_unpartition(windows, window_size, pad_xyz, xyz):
+    """
+    Window unpartition into original sequences and removing padding.
+    Args:
+        x (tensor): input tokens with [B * num_windows, window_size, window_size, window_size, C].
+        window_size (int): window size.
+        pad_xyz (Tuple): padded height and width (Xp, Yp, Zp).
+        xyz (Tuple): original height and width (X, Y, Z) before padding.
+
+    Returns:
+        x: unpartitioned sequences with [B, X, Y, Z, C].
+    """
+    Xp, Yp, Zp = pad_xyz
+    X, Y, Z = xyz
+    B = windows.shape[0] // (Xp * Yp * Zp // window_size // window_size // window_size)
+    x = windows.view(B, Xp // window_size, Yp // window_size, Zp // window_size, window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, Xp, Yp, Zp, -1)
+
+    if Xp > X or Yp > Y or Zp > Z:
+        x = x[:, :X, :Y, :Z, :].contiguous()
+    return x
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -67,14 +109,9 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(B, X*Y*Z, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.reshape(3, B * self.num_heads, X * Y * Z, -1).unbind(0)
         attn = (q * self.scale) @ k.transpose(-2, -1)
-
-        if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_x, self.rel_pos_y, self.rel_pos_z, (X, Y, Z), (X, Y, Z))
-
         attn = attn.softmax(dim=-1)
         x = (attn @ v).view(B, self.num_heads, X, Y, Z, -1).permute(0, 2, 3, 4, 1, 5).reshape(B, X, Y, Z, -1)
         x = self.proj(x)
-
         return x
     
 
@@ -189,7 +226,6 @@ class DiTBlock(nn.Module):
         
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        # approx_gelu = lambda: nn.GELU(approximate="tanh")
         approx_gelu = lambda: nn.GELU() # for torch 1.7.1
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
@@ -208,6 +244,7 @@ class DiTBlock(nn.Module):
         x = x.reshape(B, self.input_size[0], self.input_size[1], self.input_size[2], -1)
         
         # Window partition
+        # print("daozhele", self.window_size)
         if self.window_size > 0:
             X, Y, Z = x.shape[1], x.shape[2], x.shape[3]
             x, pad_xyz = window_partition(x, self.window_size)
@@ -277,7 +314,7 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         self.input_size = input_size
-        self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
+        self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=1e-7)
 
         self.x_embedder = PatchEmbed_Voxel(input_size, patch_size, in_channels, hidden_size, bias=True)
         num_patches = self.x_embedder.num_patches
@@ -288,6 +325,9 @@ class DiT(nn.Module):
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
+        # print("depth", depth)
+        # print("hiddensize", hidden_size)
+        # print("window_block_indexes", window_block_indexes)
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, 
                      num_heads, 
@@ -298,6 +338,7 @@ class DiT(nn.Module):
                      input_size=(input_size // patch_size, input_size // patch_size, input_size // patch_size)
                      ) for i in range(depth)
         ])
+
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -362,6 +403,7 @@ class DiT(nn.Module):
         # Voxelization
         features = x.permute(0, 2, 1).contiguous()  # (B, num_points, 3)
         coords = x.permute(0, 2, 1).contiguous()    # (B, num_points, 3)
+
         x, voxel_coords = self.voxelization(features, coords)
 
         x = self.x_embedder(x) 
@@ -377,7 +419,7 @@ class DiT(nn.Module):
         x = self.unpatchify_voxels(x)           
 
         # Devoxelization
-        x = F.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
+        x = trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
 
         return x
 
@@ -411,7 +453,7 @@ def get_3d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     return:
     pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
     """
-    print('grid_size:', grid_size)
+    # print('grid_size:', grid_size)
 
     grid_x = np.arange(grid_size, dtype=np.float32)
     grid_y = np.arange(grid_size, dtype=np.float32)
@@ -489,80 +531,9 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
 
-
-#################################################################################
-#                                   DiT Configs                                  #
-#################################################################################
-
-def DiT_XL_2(pretrained=False, **kwargs):
-
-    model = DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-    if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-XL-2-512x512.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if not k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
-
-    return model
-
-def DiT_XL_4(pretrained=False, **kwargs):
-
-    model = DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-    if pretrained:
-        checkpoint = torch.load('./path/to/DiT2D_pretrained_weights/DiT-XL-2-512x512.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
-    
-    return model
-
-def DiT_XL_8(pretrained=False, **kwargs):
-
-    model = DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-    if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-XL-2-512x512.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if not k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
-
-    return model
-
-def DiT_L_2(pretrained=False, **kwargs):
-    return DiT(depth=24, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-
-def DiT_L_4(pretrained=False, **kwargs):
-    return DiT(depth=24, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-
-def DiT_L_8(pretrained=False, **kwargs):
-    return DiT(depth=24, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-
-def DiT_B_2(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-def DiT_B_4(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
-
-def DiT_B_8(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
-
-def DiT_B_16(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=16, num_heads=12, **kwargs)
-
-def DiT_B_32(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=32, num_heads=12, **kwargs)
-
-def DiT_S_2(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
-
 def DiT_S_4(pretrained=False, **kwargs):
 
-    model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+    model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=12, **kwargs)
     if pretrained:
         checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-S-4.pt', map_location='cpu')
         if "ema" in checkpoint:  # supports ema checkpoints 
@@ -573,18 +544,6 @@ def DiT_S_4(pretrained=False, **kwargs):
 
     return model
 
-def DiT_S_8(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
-
-def DiT_S_16(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=16, num_heads=6, **kwargs)
-
-def DiT_S_32(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=32, num_heads=6, **kwargs)
-
 DiT3D_models_WindAttn = {
-    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
-    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
-    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+    'DiT-S/4':  DiT_S_4
 }

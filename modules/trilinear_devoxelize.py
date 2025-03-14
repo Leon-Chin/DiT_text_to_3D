@@ -3,31 +3,29 @@ import torch.nn.functional as F
 
 def trilinear_devoxelize(voxel_features, voxel_coords, resolution, training=True):
     """
-    用 PyTorch 实现三线性插值替代 `F.trilinear_devoxelize`
+    将体素网格中的特征根据连续坐标通过三线性插值还原出来。
     
-    :param voxel_features: 体素特征, shape=(B, C, X, Y, Z)
-    :param voxel_coords: 归一化的点云坐标, shape=(B, N, 3), 取值范围 [0, 1]
-    :param resolution: 体素网格的分辨率 (X, Y, Z)
-    :param training: 是否为训练模式，默认 True
+    参数：
+        voxel_features: torch.Tensor, 形状 [B, C, R, R, R]，体素化后的特征。
+        voxel_coords: torch.Tensor, 形状 [B, 3, N]，每个点云中 N 个点的连续坐标，取值范围 [0, 1]。
+        resolution: int, 网格分辨率 R。
+        training: bool, 训练模式标志（本实现中不作特殊处理）。
     
-    :return: 点云特征, shape=(B, C, N)
+    返回：
+        输出: torch.Tensor, 形状 [B, C, N]，每个点通过三线性插值得到的特征。
     """
-
-    B, C, X, Y, Z = voxel_features.shape  # 体素特征的形状
-    _, N, _ = voxel_coords.shape          # 点云坐标的形状
-
-    # 归一化到 [-1, 1]，适配 `grid_sample` 输入要求
-    norm_coords = 2.0 * voxel_coords - 1.0  # [B, N, 3] -> [-1, 1]
-
-    # 调整形状适配 `grid_sample` 需要的 (B, D, H, W, C) 格式
-    voxel_features = voxel_features.unsqueeze(2)  # (B, C, 1, X, Y, Z)
+    # 将 voxel_coords 从 [B, 3, N] 转换为 [B, N, 3]
+    coords = voxel_coords  # [B, N, 3]
+    # 将坐标从 [0, 1] 映射到 [-1, 1]（grid_sample 的要求）
+    grid = 2.0 * coords - 1.0  # [B, N, 3]
     
-    # 使用 `grid_sample` 进行三线性插值
-    sampled_features = F.grid_sample(
-        voxel_features,           # (B, C, 1, X, Y, Z)
-        norm_coords.unsqueeze(1), # (B, 1, N, 3) 作为 grid
-        mode='bilinear',          # 采用双线性插值（三维情况下仍然有效）
-        align_corners=True
-    )  # 结果形状: (B, C, 1, N)
-
-    return sampled_features.squeeze(2)  # 返回 (B, C, N)
+    # grid_sample 要求网格的形状为 [B, D_out, H_out, W_out, 3]，这里我们希望对每个点进行采样，
+    # 所以将 grid 扩展为 [B, N, 1, 1, 3]
+    grid = grid.unsqueeze(2).unsqueeze(3)  # [B, N, 1, 1, 3]
+    
+    # 使用 grid_sample 进行三线性插值，注意：mode='bilinear' 在 3D 中也实现了三线性插值
+    sampled = F.grid_sample(voxel_features, grid, mode='bilinear', align_corners=True)
+    # grid_sample 返回 [B, C, N, 1, 1]，去除多余的维度得到 [B, C, N]
+    sampled = sampled.squeeze(-1).squeeze(-1)
+    
+    return sampled
