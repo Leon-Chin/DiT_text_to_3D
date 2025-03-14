@@ -26,7 +26,7 @@ with open(RESULTS_JSON_PATH, "r") as f:
 
 for sysnet_id, models in text_annotations.items():
     num_models = len(models)
-    print(f"Category {sysnet_id} has {num_models} models.")
+    # print(f"Category {sysnet_id} has {num_models} models.")
 
 
 class Uniform15KPC(Dataset):
