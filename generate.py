@@ -4,6 +4,7 @@ import argparse
 import os
 
 from models.dit3d import DiT3D_models  # 假设你的 DiT 模型在这里定义
+from models.dit3d_window_attn import DiT3D_models_WindAttn
 from modules.trilinear_devoxelize import trilinear_devoxelize
 
 DATASET_PATH = "datasets/shapenet_data_5000_splitted"
@@ -22,6 +23,8 @@ beta_end = 0.008
 time_num = 1000
 iteration_num = 10000
 checkpoints_dir = "checkpoints"
+
+num_classes = torch.tensor([0])
 
 # 定义扩散过程类，与训练时一致
 class GaussianDiffusion:
@@ -135,7 +138,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 这里选择 DiT-S/4 模型（请根据实际情况选择合适的模型）
-    model = DiT3D_models["DiT-S/4"](pretrained=False, input_size=args.voxel_size).to(device)
+    model = DiT3D_models_WindAttn["DiT-S/4"](pretrained=False, input_size=args.voxel_size).to(device)
     model = load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
     
     model.eval()
@@ -147,10 +150,12 @@ def main(args):
 
     # 定义采样输出形状
     # 假设输出为 devoxelized 3D 对象，形状为 (B, 3, voxel_size, voxel_size, voxel_size)
-    shape = (len(args.conditions), 3, DATA_POINTS_SIZE)
+    # shape = (len(args.conditions), 3, DATA_POINTS_SIZE)
+    shape = (1, 3, DATA_POINTS_SIZE)
     
     # 使用 DDIM 采样生成 3D 对象
-    samples = ddim_sample(model, diffusion, shape, args.num_steps, device, y=args.conditions, cfg_scale=args.cfg_scale)
+    # samples = ddim_sample(model, diffusion, shape, args.num_steps, device, y=args.conditions, cfg_scale=args.cfg_scale)
+    samples = ddim_sample(model, diffusion, shape, args.num_steps, device, y=num_classes, cfg_scale=args.cfg_scale)
     print("predicted", samples.shape)
     # 如果需要，可以对生成结果进行后处理，比如 devoxelize（这里假设 trilinear_devoxelize 已内嵌于模型 forward）
     # 此处直接保存为 numpy 数组

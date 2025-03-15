@@ -1,5 +1,5 @@
 python "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/generate.py" \
-    --checkpoint "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/checkpoints/dit3D_epoch599.pth" \
+    --checkpoint "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/checkpoints/checkpoint.pth" \
     --output "generated_samples.npy" \
     --voxel_size 32 \
     --beta_start 1e-5 \
@@ -8,4 +8,3 @@ python "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/
     --num_steps 50 \
     --cfg_scale 3.0 \
     --batch_size 1 \
-    --conditions "A red chair" "A small airplane"

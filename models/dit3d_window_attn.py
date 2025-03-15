@@ -4,9 +4,14 @@ import numpy as np
 import math
 import torch.nn.functional as F
 from timm.models.vision_transformer import Mlp
-from modules.myvoxelization import Voxelization
-from modules.trilinear_devoxelize import trilinear_devoxelize
+# from modules.myvoxelization import Voxelization
+# from modules.trilinear_devoxelize import trilinear_devoxelize
 from models.text_encoder import ClipTextEncoder
+from visualize import visualize_point_cloud
+
+from modules.voxelization import Voxelization
+import modules.functional as F
+
 
 checkpoint_path = "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/checkpoints/checkpoint.pth"
 
@@ -14,27 +19,28 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 def window_partition(x, window_size):
-    # x shape: [B, X, Y, Z, C]
-# 目标 shape: [B, C, X, Y, Z]
-    print(x.shape)
+    """
+    Partition into non-overlapping windows with padding if needed.
+    Args:
+        x (tensor): input tokens with [B, X, Y, Z, C].
+        window_size (int): window size.
+
+    Returns:
+        windows: windows after partition with [B * num_windows, window_size, window_size, window_size, C].
+        (Xp, Yp, Zp): padded height and width before partition
+    """
+    print("window x.shape", x.shape)
     B, X, Y, Z, C = x.shape
+
     pad_x = (window_size - X % window_size) % window_size
     pad_y = (window_size - Y % window_size) % window_size
     pad_z = (window_size - Z % window_size) % window_size
     if pad_x > 0 or pad_y > 0 or pad_z > 0:
-        # 注意F.pad的参数顺序是从最后一个维度开始的：
-        # 对于形状 [B, X, Y, Z, C]，顺序为 (pad_C_left, pad_C_right, pad_Z_left, pad_Z_right, pad_Y_left, pad_Y_right, pad_X_left, pad_X_right)
-        # 因为我们不对 C 进行填充，所以对 C 给 (0, 0)；
-        # 然后对 Z、Y、X 分别填充 (0, pad_z)、(0, pad_y)、(0, pad_x)
-        x = x.permute(0, 4, 1, 2, 3)  # => (B, C, X, Y, Z)
-        # 对最后三维做 pad: (W_left, W_right, H_left, H_right, D_left, D_right)
-        x = F.pad(x, (0, pad_z, 0, pad_y, 0, pad_x))
-        x = x.permute(0, 2, 3, 4, 1) 
+        x = F.pad(x, (0, 0, 0, pad_x, 0, pad_y))
+
     Xp, Yp, Zp = X + pad_x, Y + pad_y, Z + pad_z
 
-    x = x.view(B, Xp // window_size, window_size,
-               Yp // window_size, window_size,
-               Zp // window_size, window_size, C)
+    x = x.view(B, Xp // window_size, window_size, Yp // window_size, window_size, Zp // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, window_size, window_size, window_size, C)
     return windows, (Xp, Yp, Zp)
 
@@ -60,7 +66,6 @@ def window_unpartition(windows, window_size, pad_xyz, xyz):
     if Xp > X or Yp > Y or Zp > Z:
         x = x[:, :X, :Y, :Z, :].contiguous()
     return x
-
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -198,24 +203,53 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
+# class LabelEmbedder(nn.Module):
+#     """
+#     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+#     """
+#     def __init__(self, hidden_size, dropout_prob):
+#         super().__init__()
+#         self.hidden_size = hidden_size
+#         self.encoder = ClipTextEncoder(dropout_prob=dropout_prob if self.training else 0)
+#         self.proj = nn.Linear(self.encoder.output_dim, hidden_size)
+        
+#     def forward(self, labels, force_drop_ids=None):
+#         with torch.no_grad():  # 确保 CLIP 编码器不更新
+#             text_features = self.encoder.encode_text(labels, force_drop_ids=force_drop_ids)  # (batch, 512)
+        
+#         embeddings = self.proj(text_features)  # 线性映射到 hidden_size 维度
+#         return embeddings 
+
+
 class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, hidden_size, dropout_prob):
+    def __init__(self, num_classes, hidden_size, dropout_prob):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.encoder = ClipTextEncoder(dropout_prob=dropout_prob if self.training else 0)
-        self.proj = nn.Linear(self.encoder.output_dim, hidden_size)
-        
-    def forward(self, labels, force_drop_ids=None):
-        with torch.no_grad():  # 确保 CLIP 编码器不更新
-            text_features = self.encoder.encode_text(labels, force_drop_ids=force_drop_ids)  # (batch, 512)
-        
-        embeddings = self.proj(text_features)  # 线性映射到 hidden_size 维度
-        return embeddings 
+        use_cfg_embedding = dropout_prob > 0
+        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
 
+    def token_drop(self, labels, force_drop_ids=None):
+        """
+        Drops labels to enable classifier-free guidance.
+        """
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids, self.num_classes, labels)
+        return labels
 
+    def forward(self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        embeddings = self.embedding_table(labels)
+        return embeddings
+    
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
@@ -321,6 +355,7 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         learn_sigma=False,
         window_size=0,
+        num_classes=1,
         window_block_indexes=(),
         use_rel_pos=False,
         rel_pos_zero_init=True
@@ -339,7 +374,7 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -379,7 +414,7 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.proj.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -420,8 +455,8 @@ class DiT(nn.Module):
         """
 
         # Voxelization
-        features = x.permute(0, 2, 1).contiguous()  # (B, num_points, 3)
-        coords = x.permute(0, 2, 1).contiguous()    # (B, num_points, 3)
+        print("forward,",x.shape)
+        features, coords = x, x
 
         x, voxel_coords = self.voxelization(features, coords)
 
@@ -429,7 +464,8 @@ class DiT(nn.Module):
         x = x + self.pos_embed
 
         t = self.t_embedder(t)                  
-        y = self.y_embedder(y)    
+        # y = self.y_embedder(y)    
+        y = self.y_embedder(y, self.training)    
         c = t + y                           
 
         for block in self.blocks:
@@ -438,8 +474,9 @@ class DiT(nn.Module):
         x = self.unpatchify_voxels(x)           
 
         # Devoxelization
-        x = trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
-
+        x = F.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
+        # print(x[0].transpose(0,1).shape)
+        # visualize_point_cloud(x[0].transpose(0,1))
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
@@ -557,7 +594,8 @@ def DiT_S_4(pretrained=True, **kwargs):
         load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
     return model
 
-def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."]):
+# def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."]):
+def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[]):
     """
     加载 checkpoint 中与当前模型匹配的参数，忽略那些键以 ignore_prefixes 开头的部分
     :param model: 当前模型
@@ -572,10 +610,11 @@ def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder
         key = key.replace("model.module.", "")
         # print("key", key)
         # 如果键不以任一 ignore_prefix 开头，并且在当前模型中存在，则加载该参数
-        if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
-            new_state[key] = value
-        else:
-            print(f"Skip loading key: {key}")
+        new_state[key] = value
+        # if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
+        #     new_state[key] = value
+        # else:
+        #     print(f"Skip loading key: {key}")
 
     # 更新当前模型的 state_dict
     model_state.update(new_state)
