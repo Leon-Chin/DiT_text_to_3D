@@ -8,33 +8,36 @@ from modules.myvoxelization import Voxelization
 from modules.trilinear_devoxelize import trilinear_devoxelize
 from models.text_encoder import ClipTextEncoder
 
+checkpoint_path = "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/checkpoints/checkpoint.pth"
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 def window_partition(x, window_size):
-    """
-    Partition into non-overlapping windows with padding if needed.
-    Args:
-        x (tensor): input tokens with [B, X, Y, Z, C].
-        window_size (int): window size.
-
-    Returns:
-        windows: windows after partition with [B * num_windows, window_size, window_size, window_size, C].
-        (Xp, Yp, Zp): padded height and width before partition
-    """
+    # x shape: [B, X, Y, Z, C]
+# 目标 shape: [B, C, X, Y, Z]
+    print(x.shape)
     B, X, Y, Z, C = x.shape
-    # print(x.shape)
     pad_x = (window_size - X % window_size) % window_size
     pad_y = (window_size - Y % window_size) % window_size
     pad_z = (window_size - Z % window_size) % window_size
     if pad_x > 0 or pad_y > 0 or pad_z > 0:
-        x = F.pad(x, (0, 0, 0, pad_x, 0, pad_y))
-
+        # 注意F.pad的参数顺序是从最后一个维度开始的：
+        # 对于形状 [B, X, Y, Z, C]，顺序为 (pad_C_left, pad_C_right, pad_Z_left, pad_Z_right, pad_Y_left, pad_Y_right, pad_X_left, pad_X_right)
+        # 因为我们不对 C 进行填充，所以对 C 给 (0, 0)；
+        # 然后对 Z、Y、X 分别填充 (0, pad_z)、(0, pad_y)、(0, pad_x)
+        x = x.permute(0, 4, 1, 2, 3)  # => (B, C, X, Y, Z)
+        # 对最后三维做 pad: (W_left, W_right, H_left, H_right, D_left, D_right)
+        x = F.pad(x, (0, pad_z, 0, pad_y, 0, pad_x))
+        x = x.permute(0, 2, 3, 4, 1) 
     Xp, Yp, Zp = X + pad_x, Y + pad_y, Z + pad_z
 
-    x = x.view(B, Xp // window_size, window_size, Yp // window_size, window_size, Zp // window_size, window_size, C)
+    x = x.view(B, Xp // window_size, window_size,
+               Yp // window_size, window_size,
+               Zp // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, window_size, window_size, window_size, C)
     return windows, (Xp, Yp, Zp)
+
 
 def window_unpartition(windows, window_size, pad_xyz, xyz):
     """
@@ -92,18 +95,6 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
 
-        self.use_rel_pos = use_rel_pos
-        if self.use_rel_pos:
-            # initialize relative positional embeddings
-            self.rel_pos_x = nn.Parameter(torch.zeros(2 * input_size[0] - 1, head_dim))
-            self.rel_pos_y = nn.Parameter(torch.zeros(2 * input_size[1] - 1, head_dim))
-            self.rel_pos_z = nn.Parameter(torch.zeros(2 * input_size[2] - 1, head_dim))
-
-            if not rel_pos_zero_init:
-                nn.init.trunc_normal_(self.rel_pos_x, std=0.02)
-                nn.init.trunc_normal_(self.rel_pos_y, std=0.02)
-                nn.init.trunc_normal_(self.rel_pos_z, std=0.02)
-
     def forward(self, x):
         B, X, Y, Z, _ = x.shape
         qkv = self.qkv(x).reshape(B, X*Y*Z, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -113,8 +104,38 @@ class Attention(nn.Module):
         x = (attn @ v).view(B, self.num_heads, X, Y, Z, -1).permute(0, 2, 3, 4, 1, 5).reshape(B, X, Y, Z, -1)
         x = self.proj(x)
         return x
-    
 
+class FlashAttention(nn.Module):
+    """基于 Flash Attention 的多头注意力模块。
+    
+    输入 x 的形状为 (B, X, Y, Z, C)，我们会先用一个线性层生成 q, k, v，
+    然后调用 torch.nn.functional.scaled_dot_product_attention 来计算注意力。
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=True, input_size=None):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.head_dim = head_dim
+        # 注意这里输出维度为 3*dim，后面再拆分成 q, k, v
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+    
+    def forward(self, x):
+        # x: (B, X, Y, Z, C)
+        B, X, Y, Z, C = x.shape
+        seq_len = X * Y * Z
+        # 生成 q, k, v 并转换形状为 (B, num_heads, seq_len, head_dim)
+        qkv = self.qkv(x).reshape(B, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, seq_len, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        # 使用 PyTorch 内置的 flash attention 计算注意力，内部会自动除以 sqrt(head_dim)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        # out: (B, num_heads, seq_len, head_dim)
+        # 将注意力输出还原成原始的空间维度
+        out = out.transpose(1, 2).reshape(B, X, Y, Z, C)
+        out = self.proj(out)
+        return out
+    
 class PatchEmbed_Voxel(nn.Module):
     """ Voxel to Patch Embedding
     """
@@ -213,12 +234,10 @@ class DiTBlock(nn.Module):
                  input_size=None, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
+        self.attn = FlashAttention(
             hidden_size,
             num_heads=num_heads,
             qkv_bias=True,
-            use_rel_pos=use_rel_pos,
-            rel_pos_zero_init=rel_pos_zero_init,
             input_size=input_size if window_size == 0 else (window_size, window_size, window_size),
         )
 
@@ -531,17 +550,38 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
 
-def DiT_S_4(pretrained=False, **kwargs):
+def DiT_S_4(pretrained=True, **kwargs):
 
-    model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=12, **kwargs)
+    model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
     if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-S-4.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
+        load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
+    return model
 
+def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."]):
+    """
+    加载 checkpoint 中与当前模型匹配的参数，忽略那些键以 ignore_prefixes 开头的部分
+    :param model: 当前模型
+    :param checkpoint_path: checkpoint 文件路径
+    :param ignore_prefixes: 一个列表，包含要忽略加载的层的前缀，例如 "y_embedder." 表示不加载该层的参数
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+    model_state = model.state_dict()
+    # print("model_state", model_state.keys())
+    new_state = {}
+    for key, value in checkpoint.items():
+        key = key.replace("model.module.", "")
+        # print("key", key)
+        # 如果键不以任一 ignore_prefix 开头，并且在当前模型中存在，则加载该参数
+        if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
+            new_state[key] = value
+        else:
+            print(f"Skip loading key: {key}")
+
+    # 更新当前模型的 state_dict
+    model_state.update(new_state)
+    model.load_state_dict(model_state)
+    print("Partial checkpoint loaded. Loaded {} parameters.".format(len(new_state)))
+    # 加上这行:
     return model
 
 DiT3D_models_WindAttn = {

@@ -4,6 +4,7 @@ import json
 
 import torch.version
 from datasets.data_preprocessing import ShapeNet15kPointClouds
+import visualize
 
 DATASET_PATH = "datasets/shapenet_data_5000_splitted"
 DATA_POINTS_SIZE = 5000
@@ -12,14 +13,14 @@ CATEGORY = ['chair', 'airplane']
 BATCH_SIZE = 8
 WINDOW_SIZE = 4
 WORKERS = 4
-DEPTH = 12
+DEPTH = 24
 window_block_indexes = (0,3,6,9)
 voxel_size = 32
-lr=1e-4
+lr=1e-5
 beta_start = 1e-5
 beta_end = 0.008
 time_num = 1000
-iteration_num = 5000
+iteration_num = 10000
 checkpoints_dir = "checkpoints"
 
 import torch
@@ -27,22 +28,20 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data
 import numpy as np
-# from models.dit3d import DiT3D_models
+from models.dit3d import DiT3D_models
 from models.dit3d_window_attn import DiT3D_models_WindAttn
 
 def get_dit3d_model():
     if WINDOW_SIZE > 0:
         return DiT3D_models_WindAttn["DiT-S/4"](
-        pretrained=False,
+        pretrained=True,
         input_size=voxel_size,
         window_size=WINDOW_SIZE,
         window_block_indexes=window_block_indexes, 
         )
-    # else :
-    #     return DiT3D_models["DiT_S_4"](
+    # return DiT3D_models["DiT-S/4"](
     #     pretrained=False,
     #     input_size=voxel_size,
-    #     num_classes=num_classes
     # )
     
 class GaussianDiffusion:
@@ -57,6 +56,7 @@ class GaussianDiffusion:
 
     def q_sample(self, x_start, t, noise=None):
         """前向扩散（Forward Process）"""
+        print("qsample",x_start.shape)
         if noise is None:
             noise = torch.randn_like(x_start)
         sqrt_alpha_cumprod = torch.sqrt(self.alphas_cumprod[t]).reshape(-1, 1, 1)
@@ -68,6 +68,10 @@ class GaussianDiffusion:
         if noise is None:
             noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
+        # print(x_noisy.shape)
+        # print("timestep",t)
+        # print(x_noisy[1].transpose(0, 1).shape)
+        # visualize.visualize_point_cloud(x_noisy[1].transpose(0, 1))
         pred_noise = model(x_noisy, t, y)
         assert pred_noise.shape == noise.shape
         if self.loss_type == "mse":
@@ -82,7 +86,7 @@ def train():
         text_annotations = json.load(f)  # 加载 JSON 文件
 
     train_dataset = ShapeNet15kPointClouds(categories=CATEGORY, split="train", text_annotations=text_annotations)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=WORKERS)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=WORKERS, drop_last=True,)
 
     # 选择模型
     model = get_dit3d_model().to(device)
@@ -95,7 +99,8 @@ def train():
     # 训练循环
     for epoch in range(iteration_num):
         for i, data in enumerate(train_loader):
-            x = data["train_points"].transpose(1, 2).to(device)  # 形状: [B, 3, 2048]
+            # visualize.visualize_point_cloud(data["train_points"][1])
+            x = data["train_points"].transpose(1, 2).to(device)  # 形状: [B, 3, N]
             y = data["text"]#TODO
 
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)  # 随机时间步

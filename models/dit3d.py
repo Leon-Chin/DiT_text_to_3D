@@ -8,15 +8,17 @@
 # GLIDE: https://github.com/openai/glide-text2im
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
-
 import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import Attention, Mlp
+import torch.nn.functional as F
+from timm.models.vision_transformer import Mlp
+from modules.myvoxelization import Voxelization
+from modules.trilinear_devoxelize import trilinear_devoxelize
+from models.text_encoder import ClipTextEncoder
 
-from modules.voxelization import Voxelization
-import modules.functional as F
+
 
 
 def modulate(x, shift, scale):
@@ -26,6 +28,52 @@ def modulate(x, shift, scale):
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FlashAttention(nn.Module):
+    """
+    Flash Attention for input shape (B, N, dim).
+    
+    其中:
+      - B: batch size
+      - N: sequence length (可以是 flatten 后的 patch/voxel 数量)
+      - dim: embedding dimension
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        """
+        x: (B, N, dim)
+        返回: (B, N, dim)
+        """
+        B, N, C = x.shape
+        # 1. 线性映射得到 q, k, v
+        qkv = self.qkv(x)              # (B, N, 3*dim)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
+        # 2. 重新排列: (3, B, num_heads, N, head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # 分别是 (B, num_heads, N, head_dim)
+
+        # 3. 使用 PyTorch 2.0 内置 flash attention
+        # scaled_dot_product_attention 会自动除以 sqrt(head_dim)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        # out: (B, num_heads, N, head_dim)
+
+        # 4. 还原回 (B, N, dim)
+        out = out.transpose(1, 2).reshape(B, N, C)
+
+        # 5. 再做一次线性映射
+        out = self.proj(out)
+        return out
+
 
 class PatchEmbed_Voxel(nn.Module):
     """ Voxel to Patch Embedding
@@ -44,8 +92,10 @@ class PatchEmbed_Voxel(nn.Module):
 
     def forward(self, x):
         B, C, X, Y, Z = x.shape
+        # print("patchEmbed_Voxel", x.shape)
         x = x.float()
         x = self.proj(x).flatten(2).transpose(1, 2)
+        # print('patchEmbed_Voxel output shape', x.shape)
         return x
     
 
@@ -93,32 +143,18 @@ class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
+    def __init__(self, hidden_size, dropout_prob):
         super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
-
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        # print('token drop drop_ids:', drop_ids, drop_ids.shape)
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
-
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        # print('token drop labels:', labels, labels.shape)
-        embeddings = self.embedding_table(labels)
-        return embeddings
+        self.hidden_size = hidden_size
+        self.encoder = ClipTextEncoder(dropout_prob=dropout_prob if self.training else 0)
+        self.proj = nn.Linear(self.encoder.output_dim, hidden_size)
+        
+    def forward(self, labels, force_drop_ids=None):
+        with torch.no_grad():  # 确保 CLIP 编码器不更新
+            text_features = self.encoder.encode_text(labels, force_drop_ids=force_drop_ids).float()  # (batch, 512)
+        
+        embeddings = self.proj(text_features)  # 线性映射到 hidden_size 维度
+        return embeddings 
 
 
 #################################################################################
@@ -132,7 +168,7 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn = FlashAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -184,7 +220,6 @@ class DiT(nn.Module):
         num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
-        num_classes=1,
         learn_sigma=False
     ):
         super().__init__()
@@ -195,13 +230,13 @@ class DiT(nn.Module):
         self.num_heads = num_heads
 
         self.input_size = input_size
-        self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=0)
+        self.voxelization = Voxelization(resolution=input_size, normalize=True, eps=1e-7)
 
         self.x_embedder = PatchEmbed_Voxel(input_size, patch_size, in_channels, hidden_size, bias=True)
         num_patches = self.x_embedder.num_patches
         
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(hidden_size, class_dropout_prob)
 
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -230,7 +265,7 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.proj.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -271,14 +306,16 @@ class DiT(nn.Module):
         """
 
         # Voxelization
-        features, coords = x, x
+        features = x.permute(0, 2, 1).contiguous()  # (B, num_points, 3)
+        coords = x.permute(0, 2, 1).contiguous()    # (B, num_points, 3)
+        print(x.shape)
         x, voxel_coords = self.voxelization(features, coords)
 
         x = self.x_embedder(x) 
         x = x + self.pos_embed 
 
         t = self.t_embedder(t)  
-        y = self.y_embedder(y, self.training)    
+        y = self.y_embedder(y)    
         c = t + y                                
 
         for block in self.blocks:
@@ -287,27 +324,75 @@ class DiT(nn.Module):
         x = self.unpatchify_voxels(x)                   
 
         # Devoxelization
-        x = F.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
-
+        x = trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
+        print("output", x.shape)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale=1.0):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        Forward pass of DiT with Classifier-Free Guidance (CFG).
+        
+        Args:
+            x (Tensor): 形状为 (B, 3, N) 的点云（或其他输入），B是批大小，N是点数。
+            t (Tensor): 形状为 (B,) 的扩散时间步。
+            y (List[str] 或其他): 文本标签或类别标签批。
+            cfg_scale (float): CFG 强度系数。1.0 表示无指导，大于1会加大条件的影响。
+            
+        Returns:
+            Tensor: shape (B, 3, N) 的输出，结合了无条件和有条件的结果。
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        # -------------------------------------------------------------------------
+        # 1) 先进行体素化，把连续点云（x）转为体素 (x_voxel, voxel_coords)
+        # -------------------------------------------------------------------------
+        features = x.permute(0, 2, 1).contiguous()  # (B, N, 3)
+        coords   = x.permute(0, 2, 1).contiguous()  # (B, N, 3)
+        x_voxel, voxel_coords = self.voxelization(features, coords)
+        
+        # -------------------------------------------------------------------------
+        # 2) 无条件 (unconditional) 分支
+        #    这里通过 force_drop_ids 来让文本编码器全部“熔断”，从而得到无条件的 y embedding
+        # -------------------------------------------------------------------------
+        x_uncond = self.x_embedder(x_voxel)          # (B, num_patches, hidden_size)
+        x_uncond = x_uncond + self.pos_embed         # 加上固定的 sine-cos 位置编码
+
+        t_emb = self.t_embedder(t)  # (B, hidden_size)
+        # 根据你的 LabelEmbedder 实现，force_drop_ids 通常可以传入整批的索引，强制让文本全部 dropout
+        y_uncond_emb = self.y_embedder(y, force_drop_ids=torch.arange(len(y), device=x.device))
+        c_uncond = t_emb + y_uncond_emb              # (B, hidden_size)
+
+        for block in self.blocks:
+            x_uncond = block(x_uncond, c_uncond)
+        out_uncond = self.final_layer(x_uncond, c_uncond)  # (B, num_patches, patch_size^3 * out_channels)
+        out_uncond = self.unpatchify_voxels(out_uncond)    # (B, out_channels, X, Y, Z)
+        out_uncond = trilinear_devoxelize(
+            out_uncond, voxel_coords, self.input_size, self.training
+        )  # (B, out_channels, N)，在你的代码里 out_channels 通常是3 或 6
+
+        # -------------------------------------------------------------------------
+        # 3) 有条件 (conditional) 分支
+        #    使用真实的文本标签 y 来获取正常的文本 embedding
+        # -------------------------------------------------------------------------
+        x_cond = self.x_embedder(x_voxel)
+        x_cond = x_cond + self.pos_embed
+
+        y_cond_emb = self.y_embedder(y)  
+        c_cond = t_emb + y_cond_emb
+
+        for block in self.blocks:
+            x_cond = block(x_cond, c_cond)
+        out_cond = self.final_layer(x_cond, c_cond)
+        out_cond = self.unpatchify_voxels(out_cond)
+        out_cond = trilinear_devoxelize(
+            out_cond, voxel_coords, self.input_size, self.training
+        )  # (B, out_channels, N)
+
+        # -------------------------------------------------------------------------
+        # 4) 用 CFG 的公式组合无条件和有条件结果
+        #    out = out_uncond + cfg_scale * (out_cond - out_uncond)
+        # -------------------------------------------------------------------------
+        out = out_uncond + cfg_scale * (out_cond - out_uncond)
+        return out
+
 
 
 #################################################################################
@@ -400,101 +485,17 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
-#################################################################################
-#                                   DiT Configs                                  #
-#################################################################################
-
-def DiT_XL_2(pretrained=False, **kwargs):
-
-    model = DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-    if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-XL-2-512x512.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if not k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
-
-    return model
-
-def DiT_XL_4(pretrained=False, **kwargs):
-
-    model = DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-    if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-XL-2-512x512.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
-    
-    return model
-
-def DiT_XL_8(pretrained=False, **kwargs):
-
-    model = DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-    if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-XL-2-512x512.pt', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
-        checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if not k.startswith('blocks')}
-        # load pre-trained blocks from 2d DiT
-        msg = model.load_state_dict(checkpoint_blocks, strict=False)
-
-    return model
-
-def DiT_L_2(pretrained=False, **kwargs):
-    return DiT(depth=24, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
-
-def DiT_L_4(pretrained=False, **kwargs):
-    return DiT(depth=24, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-
-def DiT_L_8(pretrained=False, **kwargs):
-    return DiT(depth=24, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-
-def DiT_B_2(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-def DiT_B_4(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
-
-def DiT_B_8(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
-
-def DiT_B_16(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=16, num_heads=12, **kwargs)
-
-def DiT_B_32(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=32, num_heads=12, **kwargs)
-
-def DiT_S_2(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
-
-def DiT_S_4(pretrained=False, **kwargs):
+def DiT_S_4(pretrained=True, **kwargs):
 
     model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
     if pretrained:
-        checkpoint = torch.load('/path/to/DiT2D_pretrained_weights/DiT-S-4.pth', map_location='cpu')
-        if "ema" in checkpoint:  # supports ema checkpoints 
-            checkpoint = checkpoint["ema"]
+        checkpoint = torch.load('checkpoints/dit3D_epoch499.pth', map_location='cpu')
         checkpoint_blocks = {k: checkpoint[k] for k in checkpoint if k.startswith('blocks')}
         # load pre-trained blocks from 2d DiT
         msg = model.load_state_dict(checkpoint_blocks, strict=False)
 
     return model
 
-def DiT_S_8(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
-
-def DiT_S_16(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=16, num_heads=6, **kwargs)
-
-def DiT_S_32(pretrained=False, **kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=32, num_heads=6, **kwargs)
-
 DiT3D_models = {
-    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
-    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
-    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+    'DiT-S/4':  DiT_S_4
 }
