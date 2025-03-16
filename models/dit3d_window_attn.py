@@ -13,7 +13,6 @@ from modules.voxelization import Voxelization
 import modules.functional as F
 
 
-checkpoint_path = "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/checkpoints/checkpoint.pth"
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -110,6 +109,31 @@ class Attention(nn.Module):
         x = self.proj(x)
         return x
 
+def flash_attention_legacy(q, k, v, dropout_p=0.0, is_causal=False):
+    """
+    兼容 PyTorch < 2.0 的注意力计算，手动写 scaled dot-product。
+    """
+    B, num_heads, seq_len, head_dim = q.shape
+    attn_scores = torch.matmul(q, k.transpose(-2, -1))  # (B, num_heads, seq_len, seq_len)
+    attn_scores = attn_scores / math.sqrt(head_dim)
+
+    if is_causal:
+        # 构造一个下三角 mask，大小为 (seq_len, seq_len)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), 
+            diagonal=1
+        )
+        # 在 attn_scores 上把不允许访问的位置置为 -inf
+        attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
+
+    attn_probs = F.softmax(attn_scores, dim=-1)
+
+    if dropout_p > 0.0:
+        attn_probs = F.dropout(attn_probs, p=dropout_p, training=True)
+
+    out = torch.matmul(attn_probs, v)  # (B, num_heads, seq_len, head_dim)
+    return out  # (B, num_heads, seq_len, head_dim)
+
 class FlashAttention(nn.Module):
     """基于 Flash Attention 的多头注意力模块。
     
@@ -134,12 +158,13 @@ class FlashAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, seq_len, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
         # 使用 PyTorch 内置的 flash attention 计算注意力，内部会自动除以 sqrt(head_dim)
-        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        out = flash_attention_legacy(q, k, v, dropout_p=0.0, is_causal=False)
         # out: (B, num_heads, seq_len, head_dim)
         # 将注意力输出还原成原始的空间维度
         out = out.transpose(1, 2).reshape(B, X, Y, Z, C)
         out = self.proj(out)
         return out
+    
     
 class PatchEmbed_Voxel(nn.Module):
     """ Voxel to Patch Embedding
@@ -162,7 +187,6 @@ class PatchEmbed_Voxel(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
     
-
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -590,7 +614,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 def DiT_S_4(pretrained=True, **kwargs):
-
+    checkpoint_path = "checkpoints/dit3D_epoch49.pth"
     model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
     if pretrained:
         load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
