@@ -7,7 +7,8 @@ import visualize
 
 DATASET_PATH = "datasets/shapenet_data_5000_splitted"
 RESULTS_JSON_PATH = "datasets/results.json"
-GENERATED_PATH = "output/generated_samples.npy"
+def get_sampling_path(epoch): 
+    return f"output/generated_samples_epoch{epoch}.npy"
 DATA_POINTS_SIZE = 5000
 DATA_POINTS_IN_MODEL_SIZE = 3500
 CATEGORY = ['chair']
@@ -21,7 +22,7 @@ lr=2e-4
 beta_start = 1e-5
 beta_end = 0.008
 time_num = 1000
-iteration_num = 0
+iteration_num = 1000
 checkpoints_dir = "checkpoints"
 
 import torch
@@ -74,7 +75,7 @@ def freeze_model_except(model, training_layers=[]):
         param.requires_grad = False
         # 如果名称中包含任一指定关键词，则解冻
         for layer_keyword in training_layers:
-            print(layer_keyword, name, layer_keyword in name)
+            # print(layer_keyword, name, layer_keyword in name)
             if layer_keyword in name:
                 param.requires_grad = True
                 break
@@ -91,8 +92,8 @@ def print_frozen_params(model):
         else:
             frozen_params += n
     print(f"总参数量: {total_params}")
-    print(f"可训练参数量: {trainable_params} ({100 * trainable_params / total_params:.2f}%)")
-    print(f"冻结参数量: {frozen_params} ({100 * frozen_params / total_params:.2f}%)")
+    print(f"可训练参数量: {trainable_params} ({100 * trainable_params / total_params}%)")
+    print(f"冻结参数量: {frozen_params} ({100 * frozen_params / total_params}%)")
 
 
 class GaussianDiffusion:
@@ -264,13 +265,13 @@ class GaussianDiffusion:
             x = self.ddim_sample(denoise_fn, x, t_tensor, y, eta, clip_denoised)
         return x
 
-def train_model(model, dataloader, optimizer, num_epochs, device):
+def train_model(model, dataloader, optimizer, num_epochs, device, sampling_method):
     model.train()
     for epoch in range(num_epochs):
         for i, data in enumerate(dataloader):
             # 假设 data 字典中包含 'train_points' 与 'cate_idx'
             x = data['train_points'].transpose(1, 2).to(device)
-            y = data['cate_idx'].to(device)
+            y = data['text']
             loss = model.get_loss_iter(x, None, y).mean()
             optimizer.zero_grad()
             loss.backward()
@@ -279,9 +280,47 @@ def train_model(model, dataloader, optimizer, num_epochs, device):
             if i % 50 == 0:
                 print(f"[Epoch {epoch}/ Iteration {i}/{len(dataloader)}]: Loss: {loss.item():.4f}")
         
-        # 每 50 轮保存一次模型
-        if (epoch + 1) % 50 == 0:
-            torch.save(model.state_dict(), f"{checkpoints_dir}/dit3D_epoch{epoch}.pth")
+        # 每 10 轮保存一次模型
+        if (epoch + 1) % 10 == 0:
+            torch.save(model.state_dict(), f"{checkpoints_dir}/dit3D_text_embedding.pth")
+        if (epoch + 1) == 1:
+            generate_samples(model, epoch, sampling_method, device)
+        if (epoch + 1) % 20 ==0:
+            generate_samples(model, epoch, sampling_method, device)
+
+sampling_descri = [ 
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy."
+] 
+
+def generate_samples(model, epoch, sampling_method, device):
+    # 生成样本示例
+    model.eval()
+    with torch.no_grad():
+        # 此处 y 可以视情况设定，例如全 0 表示某一类别
+        y_gen = sampling_descri
+        sample_shape = (len(y_gen), 3, DATA_POINTS_IN_MODEL_SIZE)  # 假设点云3通道
+        if sampling_method == "ddpm":
+            samples = model.gen_samples(sample_shape, device, y_gen, noise_fn=torch.randn, clip_denoised=False)
+            print("Generated samples shape:", samples.shape)
+        elif sampling_method == "ddim":
+            samples = model.gen_samples_ddim(sample_shape, device, y_gen, eta=0.5, clip_denoised=False)
+            print("DDIM generated samples shape:", samples.shape)
+        else:
+            raise ValueError(f"Unknown sampling method: {sampling_method}")
+        np.save(get_sampling_path(epoch), samples.cpu().numpy())
+    
+    model.train()
+
+        # # 生成采样轨迹（可用于观察生成过程）
+        # traj = model.gen_sample_traj(sample_shape, device, y_gen, freq=40, noise_fn=torch.randn, clip_denoised=False)
+        # print("Generated sample trajectory length:", len(traj))
 
 def main(sampling_method):
     # 设备
@@ -300,33 +339,14 @@ def main(sampling_method):
     
     # 选择模型
     model_type = get_dit3d_model()
-    freeze_model_except(model_type, ["y_embedder"])
+    freeze_model_except(model_type, ["y_embedder", "final_layer", "adaLN_modulation"])
     print_frozen_params(model=model_type)
     model = Model(diffusion, model_type).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr)
 
-    train_model(model, dataloader, optimizer, iteration_num, device)
+    train_model(model, dataloader, optimizer, iteration_num, device, sampling_method)
 
-    # 生成样本示例
-    model.eval()
-    with torch.no_grad():
-        sample_shape = (BATCH_SIZE, 3, DATA_POINTS_IN_MODEL_SIZE)  # 假设点云3通道
-        # 此处 y 可以视情况设定，例如全 0 表示某一类别
-        y_gen = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
-        if sampling_method == "ddpm":
-            samples = model.gen_samples(sample_shape, device, y_gen, noise_fn=torch.randn, clip_denoised=False)
-            print("Generated samples shape:", samples.shape)
-        elif sampling_method == "ddim":
-            samples = model.gen_samples_ddim(sample_shape, device, y_gen, eta=0.5, clip_denoised=False)
-            print("DDIM generated samples shape:", samples.shape)
-        else:
-            raise ValueError(f"Unknown sampling method: {sampling_method}")
-        np.save(GENERATED_PATH, samples.cpu().numpy())
-
-        # # 生成采样轨迹（可用于观察生成过程）
-        # traj = model.gen_sample_traj(sample_shape, device, y_gen, freq=40, noise_fn=torch.randn, clip_denoised=False)
-        # print("Generated sample trajectory length:", len(traj))
 
 if __name__ == "__main__":
     main(sampling_method = "ddim")

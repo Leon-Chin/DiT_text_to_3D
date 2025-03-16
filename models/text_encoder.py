@@ -37,7 +37,7 @@ class ClipTextEncoder:
             drop_mask = torch.zeros(batch_size, device=self.device).bool().to(self.device)
 
         modified_texts = ["" if drop_mask[i] else text_list[i] for i in range(batch_size)]
-
+        
         tokens = clip.tokenize(modified_texts, truncate=True).to(self.device)
         text_features = self.model.encode_text(tokens)  # (B, 512)
 
@@ -46,19 +46,3 @@ class ClipTextEncoder:
 
         return text_features  # (batch, 512)
 
-# texts = ["A chair with a curved backrest, a floating padded seat, and integrated armrests. Its structure relies on a cantilevered support system for ergonomic flexibility, making it suitable for contemporary interior settings.",
-# "A modern cantilever chair with a continuous metal frame, a floating padded seat, a slightly curved backrest, and integrated armrests. Its structure relies on a cantilevered support system for ergonomic flexibility, making it suitable for contemporary interior settings.",
-# "A wooden chair with a green seat, a backrest that curves slightly, and a metal frame. The chair has a simple and functional design, making it suitable for various settings.",
-# "A wooden chair with a curved backrest, armrests, and legs. The chair features a simple yet elegant design, with a focus on comfort and functionality.",
-# "A metal chair with a curved backrest, a metal armrest, and a metal frame. The chair has a unique design and is likely to be used in an office or home setting.",
-# "A wooden chair with a metal frame, a padded seat, and a curved backrest. The chair features a simple and functional design, with a focus on comfort and durability.",
-# "A modern cantilever chair with a continuous metal frame, a floating padded seat, a slightly curved backrest, and integrated armrests. Its structure relies on a cantilevered support system for ergonomic flexibility, making it suitable for contemporary interior settings.",
-# "A chair with a wooden frame, a padded seat, and a backrest that curves slightly upwards. The chair has a simple and elegant design, making it suitable for various settings.",
-# "A modern cantilever chair with a continuous metal frame, a floating padded seat, a slightly curved backrest, and integrated armrests. Its structure relies on a cantilevered support system for ergonomic flexibility, making it suitable for contemporary interior settings.",
-# "A wooden chair with a brown seat and backrest, featuring a curved design and a simple, functional structure. The chair is supported by four legs, providing stability and comfort.",
-# ]
-# encoder = ClipTextEncoder(dropout_prob=0.3)
-# features = encoder.encode_text(text_list=texts)
-# print("嵌入向量形状:", features.shape) 
-# for i in range(len(texts)):
-#     print(f"文本 {i+1} 的嵌入向量:\n{features[i]}\n")

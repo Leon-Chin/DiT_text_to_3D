@@ -10,8 +10,7 @@ from models.text_encoder import ClipTextEncoder
 from visualize import visualize_point_cloud
 
 from modules.voxelization import Voxelization
-import modules.functional as F
-
+import modules.functional as MF
 
 
 def modulate(x, shift, scale):
@@ -28,14 +27,14 @@ def window_partition(x, window_size):
         windows: windows after partition with [B * num_windows, window_size, window_size, window_size, C].
         (Xp, Yp, Zp): padded height and width before partition
     """
-    print("window x.shape", x.shape)
+    # print("window x.shape", x.shape)
     B, X, Y, Z, C = x.shape
 
     pad_x = (window_size - X % window_size) % window_size
     pad_y = (window_size - Y % window_size) % window_size
     pad_z = (window_size - Z % window_size) % window_size
     if pad_x > 0 or pad_y > 0 or pad_z > 0:
-        x = F.pad(x, (0, 0, 0, pad_x, 0, pad_y))
+        x = MF.pad(x, (0, 0, 0, pad_x, 0, pad_y))
 
     Xp, Yp, Zp = X + pad_x, Y + pad_y, Z + pad_z
 
@@ -165,7 +164,6 @@ class FlashAttention(nn.Module):
         out = self.proj(out)
         return out
     
-    
 class PatchEmbed_Voxel(nn.Module):
     """ Voxel to Patch Embedding
     """
@@ -187,6 +185,7 @@ class PatchEmbed_Voxel(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
     
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -239,7 +238,7 @@ class LabelEmbedder(nn.Module):
         
     def forward(self, labels, is_training,  force_drop_ids=None):
         with torch.no_grad():  # 确保 CLIP 编码器不更新
-            text_features = self.encoder.encode_text(labels, is_training, force_drop_ids=force_drop_ids)  # (batch, 512)
+            text_features = self.encoder.encode_text(labels, is_training, force_drop_ids=force_drop_ids).float()  # (batch, 512)
         
         embeddings = self.proj(text_features)  # 线性映射到 hidden_size 维度
         return embeddings 
@@ -481,7 +480,7 @@ class DiT(nn.Module):
         """
 
         # Voxelization
-        print("forward,",x.shape)
+        # print("forward,",x.shape)
         features, coords = x, x
 
         x, voxel_coords = self.voxelization(features, coords)
@@ -490,8 +489,13 @@ class DiT(nn.Module):
         x = x + self.pos_embed
 
         t = self.t_embedder(t)                  
-        # y = self.y_embedder(y)    
-        y = self.y_embedder(y, self.training)    
+        if y == None:
+            y = ["" for i in range(x.shape[0])]
+            force_drop_ids = torch.ones(x.shape[0], device=x.device)
+            y = self.y_embedder(y, True, force_drop_ids) 
+        else: 
+            y = self.y_embedder(y, self.training)    
+        # print("is training", self.training)
         c = t + y                           
 
         for block in self.blocks:
@@ -500,28 +504,34 @@ class DiT(nn.Module):
         x = self.unpatchify_voxels(x)           
 
         # Devoxelization
-        x = F.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
+        x = MF.trilinear_devoxelize(x, voxel_coords, self.input_size, self.training)
         # print(x[0].transpose(0,1).shape)
         # visualize_point_cloud(x[0].transpose(0,1))
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y_cond, cfg_scale=3.0):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        进行 Classifier-Free Guidance 推理。
+        
+        - x, t 都是大小 B 的 Tensor
+        - y_cond: 条件的 label (如文本) 列表/张量，大小 B
+        - y_uncond: 无条件 label (如空文本或 token drop), 若 None，就跟 y_cond 相同
+          （也可以在外部传空字符串，或 force_drop_ids 做无条件处理）
+        - cfg_scale: CFG 的强度
+
+        返回: (B, C, N) => 做了 cond/uncond 融合后的结果
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        cond_out = self.forward(x, t, y_cond)  # (2B, C, N)
+        uncond_out  = self.forward(x, t, None)  # (B, C, N)
+
+        # 4) 做 CFG 融合: 
+        #    eps = uncond + scale*(cond - uncond) = uncond + scale*cond - scale*uncond
+        #                                       = (1-scale)*uncond + scale*cond
+        # 如果你想只对前 3 个 channel 应用 guidance，请拆分一下 out_2B。
+        # 这里直接对全部 channel 做 guidance。
+        guided_out = uncond_out + cfg_scale * (cond_out - uncond_out)  # (B, C, N)
+
+        return guided_out
 
 
 #################################################################################
@@ -614,13 +624,12 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 def DiT_S_4(pretrained=True, **kwargs):
-    checkpoint_path = "checkpoints/dit3D_epoch49.pth"
+    checkpoint_path = "checkpoints/dit3D_text_embedding.pth"
     model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
     if pretrained:
         load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
     return model
 
-# def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."]):
 def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[]):
     """
     加载 checkpoint 中与当前模型匹配的参数，忽略那些键以 ignore_prefixes 开头的部分
@@ -635,7 +644,7 @@ def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[]):
     new_state = {}
     for key, value in checkpoint.items():
         key = key.replace("model.", "")
-        print("key", key)
+        # print("key", key)
         # 如果键不以任一 ignore_prefix 开头，并且在当前模型中存在，则加载该参数
         if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
             new_state[key] = value

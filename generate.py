@@ -1,179 +1,283 @@
 import torch
 import numpy as np
 import argparse
-import os
+from torch.utils.data import DataLoader
+import json
 
-from models.dit3d import DiT3D_models  # 假设你的 DiT 模型在这里定义
-from models.dit3d_window_attn import DiT3D_models_WindAttn
-from modules.trilinear_devoxelize import trilinear_devoxelize
+from datasets.data_preprocessing import ShapeNet15kPointClouds
+import visualize
 
 DATASET_PATH = "datasets/shapenet_data_5000_splitted"
-DATA_POINTS_SIZE = 3500
 RESULTS_JSON_PATH = "datasets/results.json"
-CATEGORY = ['chair', 'airplane']
+def get_sampling_path(epoch): 
+    return f"output/generated_samples_epoch{epoch}.npy"
+DATA_POINTS_SIZE = 5000
+DATA_POINTS_IN_MODEL_SIZE = 3500
+CATEGORY = ['chair']
 BATCH_SIZE = 8
 WINDOW_SIZE = 4
 WORKERS = 4
 DEPTH = 24
 window_block_indexes = (0,3,6,9)
 voxel_size = 32
-lr=1e-5
+lr=2e-4
 beta_start = 1e-5
 beta_end = 0.008
 time_num = 1000
 iteration_num = 10000
 checkpoints_dir = "checkpoints"
+DDIM_SAMPLE_STEPS=50
 
-num_classes = torch.tensor([0])
+sampling_descri = [ 
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+    "A wooden chair with a curved backrest, four legs",
+]
 
-# 定义扩散过程类，与训练时一致
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data
+from models.dit3d_window_attn import DiT3D_models_WindAttn
+
+class Model(nn.Module):
+    def __init__(self, diffusion, base_model):
+        super(Model, self).__init__()
+        self.diffusion = diffusion
+        self.model = base_model
+
+    def _denoise(self, data, t, y):
+        return self.model(data, t, y)
+
+    def get_loss_iter(self, data, noise=None, y=None):
+        B = data.shape[0]
+        t = torch.randint(0, self.diffusion.num_timesteps, (B,), device=data.device)
+        return self.diffusion.p_losses(self._denoise, data, t, noise, y)
+
+    def gen_samples(self, shape, device, y, noise_fn=torch.randn, clip_denoised=True):
+        return self.diffusion.p_sample_loop(self._denoise, shape, device, y, noise_fn, clip_denoised)
+
+    def gen_sample_traj(self, shape, device, y, freq, noise_fn=torch.randn, clip_denoised=True):
+        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape, device, y, freq, noise_fn, clip_denoised)
+    
+    def gen_samples_ddim(self, shape, device, y, eta=0.0, clip_denoised=True):
+        return self.diffusion.ddim_sample_loop(self._denoise, shape, device, y, eta, clip_denoised)
+
+def get_dit3d_model():
+    if WINDOW_SIZE > 0:
+        return DiT3D_models_WindAttn["DiT-S/4"](
+        pretrained=True,
+        input_size=voxel_size,
+        window_size=WINDOW_SIZE,
+        window_block_indexes=window_block_indexes, 
+        )
+
 class GaussianDiffusion:
-    def __init__(self, betas, device, loss_type="mse"):
+    def __init__(self, betas, loss_type, model_mean_type, model_var_type):
         self.loss_type = loss_type
-        self.betas = torch.tensor(betas, dtype=torch.float32, device=device)
-        self.num_timesteps = len(betas)
-        alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(alphas, dim=0).to(device)
+        self.model_mean_type = model_mean_type
+        self.model_var_type = model_var_type
+        betas = betas.astype(np.float64)
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        alphas = 1. - betas
+        alphas_cumprod = torch.from_numpy(np.cumprod(alphas, axis=0)).float()
+        alphas_cumprod_prev = torch.from_numpy(np.append(1., alphas_cumprod[:-1])).float()
+
+        self.betas = torch.from_numpy(betas).float()
+        self.alphas_cumprod = alphas_cumprod
+        self.alphas_cumprod_prev = alphas_cumprod_prev
+
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = torch.log(1. - alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1. / alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1. / alphas_cumprod - 1)
+
+        betas = torch.from_numpy(betas).float()
+        alphas = torch.from_numpy(alphas).float()
+        posterior_variance = self.betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        self.posterior_variance = posterior_variance
+        self.posterior_log_variance_clipped = torch.log(torch.clamp(posterior_variance, min=1e-20))
+        self.posterior_mean_coef1 = self.betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod)
+        self.posterior_mean_coef2 = (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod)
+
+    @staticmethod
+    def _extract(a, t, x_shape):
+        bs, = t.shape
+        out = torch.gather(a, 0, t)
+        return torch.reshape(out, [bs] + [1] * (len(x_shape) - 1))
+
+    def q_mean_variance(self, x_start, t):
+        mean = self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start
+        variance = self._extract(1. - self.alphas_cumprod.to(x_start.device), t, x_start.shape)
+        log_variance = self._extract(self.log_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape)
+        return mean, variance, log_variance
 
     def q_sample(self, x_start, t, noise=None):
-        """前向扩散（Forward Process）"""
         if noise is None:
             noise = torch.randn_like(x_start)
-        sqrt_alpha_cumprod = torch.sqrt(self.alphas_cumprod[t]).reshape(-1, 1, 1)
-        sqrt_one_minus_alpha = torch.sqrt(1.0 - self.alphas_cumprod[t]).reshape(-1, 1, 1)
-        return sqrt_alpha_cumprod * x_start + sqrt_one_minus_alpha * noise
+        return (
+            self._extract(self.sqrt_alphas_cumprod.to(x_start.device), t, x_start.shape) * x_start +
+            self._extract(self.sqrt_one_minus_alphas_cumprod.to(x_start.device), t, x_start.shape) * noise
+        )
 
-@torch.no_grad()
-def ddim_sample(model, diffusion, shape, num_steps, device, y=None, cfg_scale=0.0):
-    """
-    利用 DDIM 采样生成 3D 点云。
-    
-    参数:
-      - model: 训练好的 3D DiT 模型
-      - diffusion: GaussianDiffusion 实例
-      - shape: 输出形状，(B, 3, N)，如 (1, 3, 2048)
-      - num_steps: 采样步数（通常小于 diffusion.num_timesteps）
-      - y: 条件信息（文本描述或其它）
-      - cfg_scale: 若 >0，则使用 classifier-free guidance
+    def q_posterior_mean_variance(self, x_start, x_t, t):
+        posterior_mean = (
+            self._extract(self.posterior_mean_coef1.to(x_start.device), t, x_t.shape) * x_start +
+            self._extract(self.posterior_mean_coef2.to(x_start.device), t, x_t.shape) * x_t
+        )
+        posterior_variance = self._extract(self.posterior_variance.to(x_start.device), t, x_t.shape)
+        posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped.to(x_start.device), t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    返回:
-      - (B, 3, N) 的采样结果
-    """
-    print("ddim",shape)
-    B, C, N = shape
-    # 1) 初始化 x_t 为随机噪声
-    x = torch.randn(shape, device=device)  # (B, 3, N)
+    def _predict_xstart_from_eps(self, x_t, t, eps):
+        return (
+            self._extract(self.sqrt_recip_alphas_cumprod.to(x_t.device), t, x_t.shape) * x_t -
+            self._extract(self.sqrt_recipm1_alphas_cumprod.to(x_t.device), t, x_t.shape) * eps
+        )
 
-    # 2) 定义采样时间表 (简单用 linspace 等距，也可用自定义 schedule)
-    timesteps = torch.linspace(diffusion.num_timesteps - 1, 0, num_steps, device=device, dtype=torch.long)
-
-    # 3) 逐步反演
-    for step_idx, t in enumerate(timesteps):
-        t_long = t.long()  # 当前整型时间步
-        t_batch = torch.full((B,), t_long, device=device, dtype=torch.long)
-
-        # 3.1 通过模型预测 eps (或 x0 等)
-        # if cfg_scale > 0 and hasattr(model, "forward_with_cfg"):
-        #     eps = model.forward_with_cfg(x, t_batch, y, cfg_scale)  # (B, 3, N)
-        # else:
-        eps = model(x, t_batch, y)  # (B, 3, N)
-
-        # 3.2 计算 alpha_bar (对应 t)
-        alpha_bar = diffusion.alphas_cumprod[t_long]
-        if t_long > 0:
-            alpha_bar_prev = diffusion.alphas_cumprod[t_long - 1]
+    def p_mean_variance(self, denoise_fn, data, t, y, clip_denoised: bool, return_pred_xstart: bool):
+        model_output = denoise_fn(data, t, y)
+        if self.model_var_type in ['fixedsmall', 'fixedlarge']:
+            model_variance, model_log_variance = {
+                'fixedlarge': (self.betas.to(data.device),
+                               torch.log(torch.cat([self.posterior_variance[1:2], self.betas[1:]])).to(data.device)),
+                'fixedsmall': (self.posterior_variance.to(data.device), self.posterior_log_variance_clipped.to(data.device)),
+            }[self.model_var_type]
+            model_variance = self._extract(model_variance, t, data.shape) * torch.ones_like(data)
+            model_log_variance = self._extract(model_log_variance, t, data.shape) * torch.ones_like(data)
         else:
-            alpha_bar_prev = diffusion.alphas_cumprod[0]
+            raise NotImplementedError(self.model_var_type)
 
+        if self.model_mean_type == 'eps':
+            x_recon = self._predict_xstart_from_eps(data, t=t, eps=model_output)
+            if clip_denoised:
+                x_recon = torch.clamp(x_recon, -0.5, 0.5)
+            model_mean, _, _ = self.q_posterior_mean_variance(x_start=x_recon, x_t=data, t=t)
+        else:
+            raise NotImplementedError(self.loss_type)
+
+        if return_pred_xstart:
+            return model_mean, model_variance, model_log_variance, x_recon
+        else:
+            return model_mean, model_variance, model_log_variance
+
+    def p_sample(self, denoise_fn, data, t, noise_fn, y, clip_denoised=False, return_pred_xstart=False):
+        model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
+            denoise_fn, data, t, y, clip_denoised, return_pred_xstart=True)
+        noise = noise_fn(data.shape, dtype=data.dtype, device=data.device)
+        nonzero_mask = (1 - (t == 0).float()).view(data.shape[0], *([1] * (len(data.shape) - 1)))
+        sample = model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
+        if return_pred_xstart:
+            return sample, pred_xstart
+        else:
+            return sample
+
+    def p_sample_loop(self, denoise_fn, shape, device, y, noise_fn=torch.randn, clip_denoised=True):
+        img_t = noise_fn(shape, dtype=torch.float, device=device)
+        for t in reversed(range(self.num_timesteps)):
+            t_tensor = torch.full((shape[0],), t, dtype=torch.int64, device=device)
+            img_t = self.p_sample(denoise_fn, img_t, t_tensor, noise_fn, y, clip_denoised=clip_denoised)
+        return img_t
+
+    def p_sample_loop_trajectory(self, denoise_fn, shape, device, y, freq, noise_fn=torch.randn, clip_denoised=True):
+        total_steps = self.num_timesteps
+        img_t = noise_fn(shape, dtype=torch.float, device=device)
+        imgs = [img_t]
+        for t in reversed(range(total_steps)):
+            t_tensor = torch.full((shape[0],), t, dtype=torch.int64, device=device)
+            img_t = self.p_sample(denoise_fn, img_t, t_tensor, noise_fn, y, clip_denoised=clip_denoised)
+            if t % freq == 0 or t == total_steps - 1:
+                imgs.append(img_t)
+        return imgs
+
+    def p_losses(self, denoise_fn, data_start, t, noise=None, y=None):
+        B = data_start.shape[0]
+        if noise is None:
+            noise = torch.randn_like(data_start)
+        data_t = self.q_sample(data_start, t, noise)
+        if self.loss_type == 'mse':
+            eps_recon = denoise_fn(data_t, t, y)
+            losses = ((noise - eps_recon) ** 2).mean(dim=list(range(1, len(data_start.shape))))
+        else:
+            raise NotImplementedError(self.loss_type)
+        return losses
+
+    def ddim_sample(self, denoise_fn, x_t, t, y, eta=0.2, clip_denoised=True):
+        """
+        DDIM 单步采样更新
+        eta：控制随机性，eta=0时为确定性采样
+        """
+        # 预测噪声
+        eps = denoise_fn(x_t, t, y)
+        # 提取当前时间步的 alpha_bar
+        alpha_bar = self._extract(self.alphas_cumprod.to(x_t.device), t, x_t.shape)
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
-        sqrt_one_minus_alpha = torch.sqrt(1 - alpha_bar)
-        sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
-        sqrt_one_minus_alpha_prev = torch.sqrt(1 - alpha_bar_prev)
+        sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
+        # 根据公式预测 x0
+        x0_pred = (x_t - sqrt_one_minus_alpha_bar * eps) / sqrt_alpha_bar
+        if clip_denoised:
+            x0_pred = torch.clamp(x0_pred, -0.5, 0.5)
+        # 提取上一步的 alpha_bar，即 alpha_bar_{t-1}
+        alpha_bar_prev = self._extract(self.alphas_cumprod_prev.to(x_t.device), t, x_t.shape)
+        # 计算 DDIM 更新中的 sigma
+        sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar) * (1 - alpha_bar / alpha_bar_prev))
+        # 当 eta = 0 时噪声项为 0，实现确定性采样
+        noise = torch.randn_like(x_t) if eta > 0 else 0.
+        # DDIM 更新公式
+        x_t_prev = torch.sqrt(alpha_bar_prev) * x0_pred + \
+                   torch.sqrt(1 - alpha_bar_prev - sigma**2) * eps + \
+                   sigma * noise
+        return x_t_prev
 
-        # 3.3 DDIM 公式：预测 x0
-        #     x0 = (x - sqrt(1 - alpha_bar) * eps) / sqrt(alpha_bar)
-        x0 = (x - sqrt_one_minus_alpha * eps) / sqrt_alpha_bar
+    def ddim_sample_loop(self, denoise_fn, shape, device, y, eta=0.0, clip_denoised=True):
+        """
+        DDIM 多步采样
+        """
+        x = torch.randn(shape, dtype=torch.float, device=device)
+        for t in reversed(range(DDIM_SAMPLE_STEPS)):
+            t_tensor = torch.full((shape[0],), t, dtype=torch.int64, device=device)
+            x = self.ddim_sample(denoise_fn, x, t_tensor, y, eta, clip_denoised)
+        return x
 
-        # 3.4 如果还没到最后一步，则往前一步
-        if step_idx < num_steps - 1:
-            # 这里演示一个最简约的“无梯度 DDIM”，
-            # x_{t-1} = sqrt(alpha_bar_{t-1}) * x0 + sqrt(1 - alpha_bar_{t-1}) * eps
-            # 你可以在此处插入自定义的 DDIM/DDPM 等更多细节。
-            x = sqrt_alpha_bar_prev * x0 + sqrt_one_minus_alpha_prev * eps
-        else:
-            # 最后一步就直接用 x0
-            x = x0
-
-    return x
-
-def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."]):
-    """
-    加载 checkpoint 中与当前模型匹配的参数，忽略那些键以 ignore_prefixes 开头的部分
-    :param model: 当前模型
-    :param checkpoint_path: checkpoint 文件路径
-    :param ignore_prefixes: 一个列表，包含要忽略加载的层的前缀，例如 "y_embedder." 表示不加载该层的参数
-    """
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")["model_state"]
-    model_state = model.state_dict()
-    # print("model_state", model_state.keys())
-    new_state = {}
-    for key, value in checkpoint.items():
-        key = key.replace("model.module.", "")
-        # print("key", key)
-        # 如果键不以任一 ignore_prefix 开头，并且在当前模型中存在，则加载该参数
-        if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
-            new_state[key] = value
-        else:
-            print(f"Skip loading key: {key}")
-
-    # 更新当前模型的 state_dict
-    model_state.update(new_state)
-    model.load_state_dict(model_state)
-    print("Partial checkpoint loaded. Loaded {} parameters.".format(len(new_state)))
-    return model
-    
-checkpoint_path = "/Users/qinleiheng/Documents/秦磊恒/IP Paris/Master 1/Computer Vision/Project/Project Code/DiT-text-to-3D/checkpoints/checkpoint.pth"
-
-def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 这里选择 DiT-S/4 模型（请根据实际情况选择合适的模型）
-    model = DiT3D_models_WindAttn["DiT-S/4"](pretrained=False, input_size=args.voxel_size).to(device)
-    model = load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
-    
+def generate_samples(model, sampling_method, device):
+    # 生成样本示例
     model.eval()
-    print("Model loaded.")
+    with torch.no_grad():
+        # 此处 y 可以视情况设定，例如全 0 表示某一类别
+        y_gen = sampling_descri
+        print("len",len(y_gen))
+        sample_shape = (len(y_gen), 3, DATA_POINTS_IN_MODEL_SIZE)  # 假设点云3通道
+        if sampling_method == "ddpm":
+            samples = model.gen_samples(sample_shape, device, y_gen, noise_fn=torch.randn, clip_denoised=False)
+            print("Generated samples shape:", samples.shape)
+        elif sampling_method == "ddim":
+            samples = model.gen_samples_ddim(sample_shape, device, y_gen, eta=0.5, clip_denoised=False)
+            print("DDIM generated samples shape:", samples.shape)
+        else:
+            raise ValueError(f"Unknown sampling method: {sampling_method}")
+        np.save("output/generated_samples_temp.npy", samples.cpu().numpy())
 
-    # 生成 beta schedule，与训练时一致
-    betas = np.linspace(args.beta_start, args.beta_end, args.time_num)
-    diffusion = GaussianDiffusion(betas, device=device)
+        # # 生成采样轨迹（可用于观察生成过程）
+        # traj = model.gen_sample_traj(sample_shape, device, y_gen, freq=40, noise_fn=torch.randn, clip_denoised=False)
+        # print("Generated sample trajectory length:", len(traj))
 
-    # 定义采样输出形状
-    # 假设输出为 devoxelized 3D 对象，形状为 (B, 3, voxel_size, voxel_size, voxel_size)
-    # shape = (len(args.conditions), 3, DATA_POINTS_SIZE)
-    shape = (1, 3, DATA_POINTS_SIZE)
-    
-    # 使用 DDIM 采样生成 3D 对象
-    # samples = ddim_sample(model, diffusion, shape, args.num_steps, device, y=args.conditions, cfg_scale=args.cfg_scale)
-    samples = ddim_sample(model, diffusion, shape, args.num_steps, device, y=num_classes, cfg_scale=args.cfg_scale)
-    print("predicted", samples.shape)
-    # 如果需要，可以对生成结果进行后处理，比如 devoxelize（这里假设 trilinear_devoxelize 已内嵌于模型 forward）
-    # 此处直接保存为 numpy 数组
-    output_path = args.output
-    np.save(output_path, samples.cpu().numpy())
-    print(f"Generated samples saved to {output_path}")
+def main(sampling_method):
+    # 设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
+    # 生成 beta schedule（用于扩散过程）
+    betas = np.linspace(beta_start, beta_end, time_num)
+    diffusion = GaussianDiffusion(betas, loss_type='mse', model_mean_type='eps', model_var_type='fixedsmall')
+    # 选择模型
+    model_type = get_dit3d_model()
+    model = Model(diffusion, model_type).to(device)
+    generate_samples(model, sampling_method, device)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="3D Object Generation using DiT and DDIM Sampling")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--output", type=str, default="generated_samples.npy", help="File to save generated samples")
-    parser.add_argument("--voxel_size", type=int, default=32, help="Voxel resolution (assumed cubic)")
-    parser.add_argument("--beta_start", type=float, default=1e-5, help="Beta start value")
-    parser.add_argument("--beta_end", type=float, default=0.008, help="Beta end value")
-    parser.add_argument("--time_num", type=int, default=1000, help="Total diffusion timesteps used during training")
-    parser.add_argument("--num_steps", type=int, default=50, help="DDIM sampling steps")
-    parser.add_argument("--cfg_scale", type=float, default=3.0, help="Classifier-free guidance scale (0 for none)")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for generation")
-    parser.add_argument("--conditions", type=str, nargs="+", default=[], help="Conditional text prompt (if any)")
-    args = parser.parse_args()
-    main(args)
+    main(sampling_method = "ddim")
