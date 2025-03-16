@@ -20,7 +20,7 @@ class ClipTextEncoder:
         self.model, self.preprocess = clip.load(model_name, device=device)
         
     @torch.no_grad()
-    def encode_text(self, text_list, force_drop_ids=None):
+    def encode_text(self, text_list, is_training, force_drop_ids=None):
         """
         将文本列表编码为 (batch, hidden_size) 的张量，并支持 CFG 文本随机丢弃
         :param text_list: List[str], 包含多条文本描述
@@ -28,11 +28,13 @@ class ClipTextEncoder:
         :return: torch.FloatTensor(shape: (batch, hidden_dim))
         """
         batch_size = len(text_list)
-
-        if force_drop_ids is not None:
-            drop_mask = force_drop_ids.bool().to(self.device)
+        if is_training:
+            if force_drop_ids is not None:
+                drop_mask = force_drop_ids.bool().to(self.device)
+            else:
+                drop_mask = torch.rand(batch_size, device=self.device) < self.dropout_prob
         else:
-            drop_mask = torch.rand(batch_size, device=self.device) < self.dropout_prob
+            drop_mask = torch.zeros(batch_size, device=self.device).bool().to(self.device)
 
         modified_texts = ["" if drop_mask[i] else text_list[i] for i in range(batch_size)]
 

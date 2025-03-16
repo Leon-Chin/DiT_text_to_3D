@@ -203,52 +203,52 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-# class LabelEmbedder(nn.Module):
-#     """
-#     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-#     """
-#     def __init__(self, hidden_size, dropout_prob):
-#         super().__init__()
-#         self.hidden_size = hidden_size
-#         self.encoder = ClipTextEncoder(dropout_prob=dropout_prob if self.training else 0)
-#         self.proj = nn.Linear(self.encoder.output_dim, hidden_size)
-        
-#     def forward(self, labels, force_drop_ids=None):
-#         with torch.no_grad():  # 确保 CLIP 编码器不更新
-#             text_features = self.encoder.encode_text(labels, force_drop_ids=force_drop_ids)  # (batch, 512)
-        
-#         embeddings = self.proj(text_features)  # 线性映射到 hidden_size 维度
-#         return embeddings 
-
-
 class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob):
+    def __init__(self, hidden_size, dropout_prob):
         super().__init__()
-        use_cfg_embedding = dropout_prob > 0
-        self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
-        self.num_classes = num_classes
-        self.dropout_prob = dropout_prob
+        self.hidden_size = hidden_size
+        self.encoder = ClipTextEncoder(dropout_prob=dropout_prob if self.training else 0)
+        self.proj = nn.Linear(self.encoder.output_dim, hidden_size)
+        
+    def forward(self, labels, is_training,  force_drop_ids=None):
+        with torch.no_grad():  # 确保 CLIP 编码器不更新
+            text_features = self.encoder.encode_text(labels, is_training, force_drop_ids=force_drop_ids)  # (batch, 512)
+        
+        embeddings = self.proj(text_features)  # 线性映射到 hidden_size 维度
+        return embeddings 
 
-    def token_drop(self, labels, force_drop_ids=None):
-        """
-        Drops labels to enable classifier-free guidance.
-        """
-        if force_drop_ids is None:
-            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
-        else:
-            drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
 
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
-        if (train and use_dropout) or (force_drop_ids is not None):
-            labels = self.token_drop(labels, force_drop_ids)
-        embeddings = self.embedding_table(labels)
-        return embeddings
+# class LabelEmbedder(nn.Module):
+#     """
+#     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
+#     """
+#     def __init__(self, num_classes, hidden_size, dropout_prob):
+#         super().__init__()
+#         use_cfg_embedding = dropout_prob > 0
+#         self.embedding_table = nn.Embedding(num_classes + use_cfg_embedding, hidden_size)
+#         self.num_classes = num_classes
+#         self.dropout_prob = dropout_prob
+
+#     def token_drop(self, labels, force_drop_ids=None):
+#         """
+#         Drops labels to enable classifier-free guidance.
+#         """
+#         if force_drop_ids is None:
+#             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+#         else:
+#             drop_ids = force_drop_ids == 1
+#         labels = torch.where(drop_ids, self.num_classes, labels)
+#         return labels
+
+#     def forward(self, labels, train, force_drop_ids=None):
+#         use_dropout = self.dropout_prob > 0
+#         if (train and use_dropout) or (force_drop_ids is not None):
+#             labels = self.token_drop(labels, force_drop_ids)
+#         embeddings = self.embedding_table(labels)
+#         return embeddings
     
 #################################################################################
 #                                 Core DiT Model                                #
@@ -374,7 +374,8 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        # self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.y_embedder = LabelEmbedder(hidden_size, class_dropout_prob)
 
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -414,7 +415,8 @@ class DiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.proj.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -602,19 +604,19 @@ def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[]):
     :param checkpoint_path: checkpoint 文件路径
     :param ignore_prefixes: 一个列表，包含要忽略加载的层的前缀，例如 "y_embedder." 表示不加载该层的参数
     """
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+    # checkpoint = torch.load(checkpoint_path, map_location="cpu")["model_state"]
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model_state = model.state_dict()
     # print("model_state", model_state.keys())
     new_state = {}
     for key, value in checkpoint.items():
-        key = key.replace("model.module.", "")
-        # print("key", key)
+        key = key.replace("model.", "")
+        print("key", key)
         # 如果键不以任一 ignore_prefix 开头，并且在当前模型中存在，则加载该参数
-        new_state[key] = value
-        # if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
-        #     new_state[key] = value
-        # else:
-        #     print(f"Skip loading key: {key}")
+        if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
+            new_state[key] = value
+        else:
+            print(f"Skip loading key: {key}")
 
     # 更新当前模型的 state_dict
     model_state.update(new_state)

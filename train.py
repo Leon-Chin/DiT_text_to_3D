@@ -9,7 +9,7 @@ DATASET_PATH = "datasets/shapenet_data_5000_splitted"
 RESULTS_JSON_PATH = "datasets/results.json"
 GENERATED_PATH = "output/generated_samples.npy"
 DATA_POINTS_SIZE = 5000
-DATA_POINTS_For_Generation_SIZE = 3500
+DATA_POINTS_IN_MODEL_SIZE = 3500
 CATEGORY = ['chair']
 BATCH_SIZE = 8
 WINDOW_SIZE = 4
@@ -21,7 +21,7 @@ lr=2e-4
 beta_start = 1e-5
 beta_end = 0.008
 time_num = 1000
-iteration_num = 10
+iteration_num = 0
 checkpoints_dir = "checkpoints"
 
 import torch
@@ -51,6 +51,9 @@ class Model(nn.Module):
 
     def gen_sample_traj(self, shape, device, y, freq, noise_fn=torch.randn, clip_denoised=True):
         return self.diffusion.p_sample_loop_trajectory(self._denoise, shape, device, y, freq, noise_fn, clip_denoised)
+    
+    def gen_samples_ddim(self, shape, device, y, eta=0.0, clip_denoised=True):
+        return self.diffusion.ddim_sample_loop(self._denoise, shape, device, y, eta, clip_denoised)
 
 def get_dit3d_model():
     if WINDOW_SIZE > 0:
@@ -64,7 +67,34 @@ def get_dit3d_model():
     #     pretrained=False,
     #     input_size=voxel_size,
     # )
-    
+
+def freeze_model_except(model, training_layers=[]):
+    for name, param in model.named_parameters():
+        # 默认冻结所有参数
+        param.requires_grad = False
+        # 如果名称中包含任一指定关键词，则解冻
+        for layer_keyword in training_layers:
+            print(layer_keyword, name, layer_keyword in name)
+            if layer_keyword in name:
+                param.requires_grad = True
+                break
+
+def print_frozen_params(model):
+    total_params = 0
+    frozen_params = 0
+    trainable_params = 0
+    for name, param in model.named_parameters():
+        n = param.numel()
+        total_params += n
+        if param.requires_grad:
+            trainable_params += n
+        else:
+            frozen_params += n
+    print(f"总参数量: {total_params}")
+    print(f"可训练参数量: {trainable_params} ({100 * trainable_params / total_params:.2f}%)")
+    print(f"冻结参数量: {frozen_params} ({100 * frozen_params / total_params:.2f}%)")
+
+
 class GaussianDiffusion:
     def __init__(self, betas, loss_type, model_mean_type, model_var_type):
         self.loss_type = loss_type
@@ -196,8 +226,8 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.loss_type)
         return losses
-    
-    def ddim_sample(self, denoise_fn, x_t, t, y, eta=0.5, clip_denoised=True):
+
+    def ddim_sample(self, denoise_fn, x_t, t, y, eta=0.2, clip_denoised=True):
         """
         DDIM 单步采样更新
         eta：控制随机性，eta=0时为确定性采样
@@ -205,7 +235,7 @@ class GaussianDiffusion:
         # 预测噪声
         eps = denoise_fn(x_t, t, y)
         # 提取当前时间步的 alpha_bar
-        alpha_bar = self._extract(self.alphas_cumprod, t, x_t.shape)
+        alpha_bar = self._extract(self.alphas_cumprod.to(x_t.device), t, x_t.shape)
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
         sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
         # 根据公式预测 x0
@@ -213,7 +243,7 @@ class GaussianDiffusion:
         if clip_denoised:
             x0_pred = torch.clamp(x0_pred, -0.5, 0.5)
         # 提取上一步的 alpha_bar，即 alpha_bar_{t-1}
-        alpha_bar_prev = self._extract(self.alphas_cumprod_prev, t, x_t.shape)
+        alpha_bar_prev = self._extract(self.alphas_cumprod_prev.to(x_t.device), t, x_t.shape)
         # 计算 DDIM 更新中的 sigma
         sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar) * (1 - alpha_bar / alpha_bar_prev))
         # 当 eta = 0 时噪声项为 0，实现确定性采样
@@ -249,13 +279,12 @@ def train_model(model, dataloader, optimizer, num_epochs, device):
             if i % 50 == 0:
                 print(f"[Epoch {epoch}/ Iteration {i}/{len(dataloader)}]: Loss: {loss.item():.4f}")
         
-        # 每 100 轮保存一次模型
-        if (epoch + 1) % 100 == 0:
+        # 每 50 轮保存一次模型
+        if (epoch + 1) % 50 == 0:
             torch.save(model.state_dict(), f"{checkpoints_dir}/dit3D_epoch{epoch}.pth")
 
-def main():
+def main(sampling_method):
     # 设备
-    # device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
 
@@ -271,6 +300,8 @@ def main():
     
     # 选择模型
     model_type = get_dit3d_model()
+    freeze_model_except(model_type, ["y_embedder"])
+    print_frozen_params(model=model_type)
     model = Model(diffusion, model_type).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr)
@@ -280,16 +311,22 @@ def main():
     # 生成样本示例
     model.eval()
     with torch.no_grad():
-        sample_shape = (BATCH_SIZE, 3, DATA_POINTS_For_Generation_SIZE)
+        sample_shape = (BATCH_SIZE, 3, DATA_POINTS_IN_MODEL_SIZE)  # 假设点云3通道
         # 此处 y 可以视情况设定，例如全 0 表示某一类别
         y_gen = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)
-        samples = model.gen_samples(sample_shape, device, y_gen, noise_fn=torch.randn, clip_denoised=False)
-        print("Generated samples shape:", samples.shape)
+        if sampling_method == "ddpm":
+            samples = model.gen_samples(sample_shape, device, y_gen, noise_fn=torch.randn, clip_denoised=False)
+            print("Generated samples shape:", samples.shape)
+        elif sampling_method == "ddim":
+            samples = model.gen_samples_ddim(sample_shape, device, y_gen, eta=0.5, clip_denoised=False)
+            print("DDIM generated samples shape:", samples.shape)
+        else:
+            raise ValueError(f"Unknown sampling method: {sampling_method}")
         np.save(GENERATED_PATH, samples.cpu().numpy())
 
-        # 生成采样轨迹（可用于观察生成过程）
-        traj = model.gen_sample_traj(sample_shape, device, y_gen, freq=40, noise_fn=torch.randn, clip_denoised=False)
-        print("Generated sample trajectory length:", len(traj))
+        # # 生成采样轨迹（可用于观察生成过程）
+        # traj = model.gen_sample_traj(sample_shape, device, y_gen, freq=40, noise_fn=torch.randn, clip_denoised=False)
+        # print("Generated sample trajectory length:", len(traj))
 
 if __name__ == "__main__":
-    main()
+    main(sampling_method = "ddim")
