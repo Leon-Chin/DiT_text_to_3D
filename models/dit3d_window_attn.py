@@ -109,20 +109,15 @@ class Attention(nn.Module):
         return x
 
 def flash_attention_legacy(q, k, v, dropout_p=0.0, is_causal=False):
-    """
-    兼容 PyTorch < 2.0 的注意力计算，手动写 scaled dot-product。
-    """
     B, num_heads, seq_len, head_dim = q.shape
     attn_scores = torch.matmul(q, k.transpose(-2, -1))  # (B, num_heads, seq_len, seq_len)
     attn_scores = attn_scores / math.sqrt(head_dim)
 
     if is_causal:
-        # 构造一个下三角 mask，大小为 (seq_len, seq_len)
         causal_mask = torch.triu(
             torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool), 
             diagonal=1
         )
-        # 在 attn_scores 上把不允许访问的位置置为 -inf
         attn_scores = attn_scores.masked_fill(causal_mask, float('-inf'))
 
     attn_probs = F.softmax(attn_scores, dim=-1)
@@ -134,17 +129,12 @@ def flash_attention_legacy(q, k, v, dropout_p=0.0, is_causal=False):
     return out  # (B, num_heads, seq_len, head_dim)
 
 class FlashAttention(nn.Module):
-    """基于 Flash Attention 的多头注意力模块。
-    
-    输入 x 的形状为 (B, X, Y, Z, C)，我们会先用一个线性层生成 q, k, v，
-    然后调用 torch.nn.functional.scaled_dot_product_attention 来计算注意力。
-    """
     def __init__(self, dim, num_heads=8, qkv_bias=True, input_size=None):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.head_dim = head_dim
-        # 注意这里输出维度为 3*dim，后面再拆分成 q, k, v
+        # q, k, v
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
     
@@ -152,14 +142,11 @@ class FlashAttention(nn.Module):
         # x: (B, X, Y, Z, C)
         B, X, Y, Z, C = x.shape
         seq_len = X * Y * Z
-        # 生成 q, k, v 并转换形状为 (B, num_heads, seq_len, head_dim)
         qkv = self.qkv(x).reshape(B, seq_len, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, seq_len, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        # 使用 PyTorch 内置的 flash attention 计算注意力，内部会自动除以 sqrt(head_dim)
         out = flash_attention_legacy(q, k, v, dropout_p=0.0, is_causal=False)
         # out: (B, num_heads, seq_len, head_dim)
-        # 将注意力输出还原成原始的空间维度
         out = out.transpose(1, 2).reshape(B, X, Y, Z, C)
         out = self.proj(out)
         return out
@@ -510,25 +497,9 @@ class DiT(nn.Module):
         return x
 
     def forward_with_cfg(self, x, t, y_cond, cfg_scale=3.0):
-        """
-        进行 Classifier-Free Guidance 推理。
-        
-        - x, t 都是大小 B 的 Tensor
-        - y_cond: 条件的 label (如文本) 列表/张量，大小 B
-        - y_uncond: 无条件 label (如空文本或 token drop), 若 None，就跟 y_cond 相同
-          （也可以在外部传空字符串，或 force_drop_ids 做无条件处理）
-        - cfg_scale: CFG 的强度
-
-        返回: (B, C, N) => 做了 cond/uncond 融合后的结果
-        """
         cond_out = self.forward(x, t, y_cond)  # (2B, C, N)
         uncond_out  = self.forward(x, t, None)  # (B, C, N)
 
-        # 4) 做 CFG 融合: 
-        #    eps = uncond + scale*(cond - uncond) = uncond + scale*cond - scale*uncond
-        #                                       = (1-scale)*uncond + scale*cond
-        # 如果你想只对前 3 个 channel 应用 guidance，请拆分一下 out_2B。
-        # 这里直接对全部 channel 做 guidance。
         guided_out = uncond_out + cfg_scale * (cond_out - uncond_out)  # (B, C, N)
 
         return guided_out
@@ -627,16 +598,12 @@ def DiT_S_4(pretrained=True, **kwargs):
     checkpoint_path = "checkpoints/dit3D_text_embedding.pth"
     model = DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
     if pretrained:
-        load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
-    return model
+        # first time
+        # model = load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=["y_embedder."])
+        model = load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[])
+        return model
 
 def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[]):
-    """
-    加载 checkpoint 中与当前模型匹配的参数，忽略那些键以 ignore_prefixes 开头的部分
-    :param model: 当前模型
-    :param checkpoint_path: checkpoint 文件路径
-    :param ignore_prefixes: 一个列表，包含要忽略加载的层的前缀，例如 "y_embedder." 表示不加载该层的参数
-    """
     # checkpoint = torch.load(checkpoint_path, map_location="cpu")["model_state"]
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model_state = model.state_dict()
@@ -645,17 +612,14 @@ def load_partial_checkpoint(model, checkpoint_path, ignore_prefixes=[]):
     for key, value in checkpoint.items():
         key = key.replace("model.", "")
         # print("key", key)
-        # 如果键不以任一 ignore_prefix 开头，并且在当前模型中存在，则加载该参数
         if key in model_state and not any(key.startswith(prefix) for prefix in ignore_prefixes):
             new_state[key] = value
         else:
             print(f"Skip loading key: {key}")
 
-    # 更新当前模型的 state_dict
     model_state.update(new_state)
     model.load_state_dict(model_state)
-    print("Partial checkpoint loaded. Loaded {} parameters.".format(len(new_state)))
-    # 加上这行:
+    print("checkpoint loaded. Loaded {} parameters.".format(len(new_state)))
     return model
 
 DiT3D_models_WindAttn = {

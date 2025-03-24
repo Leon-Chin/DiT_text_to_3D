@@ -91,9 +91,9 @@ def print_frozen_params(model):
             trainable_params += n
         else:
             frozen_params += n
-    print(f"总参数量: {total_params}")
-    print(f"可训练参数量: {trainable_params} ({100 * trainable_params / total_params}%)")
-    print(f"冻结参数量: {frozen_params} ({100 * frozen_params / total_params}%)")
+    print(f"Total number of parameters: {total_params}")
+    print(f"Trainable parameters: {trainable_params} ({100 * trainable_params / total_params}%)")
+    print(f"Freeze parameters: {frozen_params} ({100 * frozen_params / total_params}%)")
 
 
 class GaussianDiffusion:
@@ -229,21 +229,13 @@ class GaussianDiffusion:
         return losses
 
     def ddim_sample(self, denoise_fn, x_t, t, y, eta=0.2, clip_denoised=True):
-        """
-        DDIM 单步采样更新
-        eta：控制随机性，eta=0时为确定性采样
-        """
-        # 预测噪声
         eps = denoise_fn(x_t, t, y)
-        # 提取当前时间步的 alpha_bar
         alpha_bar = self._extract(self.alphas_cumprod.to(x_t.device), t, x_t.shape)
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
         sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
-        # 根据公式预测 x0
         x0_pred = (x_t - sqrt_one_minus_alpha_bar * eps) / sqrt_alpha_bar
         if clip_denoised:
             x0_pred = torch.clamp(x0_pred, -0.5, 0.5)
-        # 提取上一步的 alpha_bar，即 alpha_bar_{t-1}
         alpha_bar_prev = self._extract(self.alphas_cumprod_prev.to(x_t.device), t, x_t.shape)
         # 计算 DDIM 更新中的 sigma
         sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar) * (1 - alpha_bar / alpha_bar_prev))
@@ -256,9 +248,6 @@ class GaussianDiffusion:
         return x_t_prev
 
     def ddim_sample_loop(self, denoise_fn, shape, device, y, eta=0.0, clip_denoised=True):
-        """
-        DDIM 多步采样
-        """
         x = torch.randn(shape, dtype=torch.float, device=device)
         for t in reversed(range(self.num_timesteps)):
             t_tensor = torch.full((shape[0],), t, dtype=torch.int64, device=device)
@@ -269,7 +258,6 @@ def train_model(model, dataloader, optimizer, num_epochs, device, sampling_metho
     model.train()
     for epoch in range(num_epochs):
         for i, data in enumerate(dataloader):
-            # 假设 data 字典中包含 'train_points' 与 'cate_idx'
             x = data['train_points'].transpose(1, 2).to(device)
             y = data['text']
             loss = model.get_loss_iter(x, None, y).mean()
@@ -289,21 +277,28 @@ def train_model(model, dataloader, optimizer, num_epochs, device, sampling_metho
             generate_samples(model, epoch, sampling_method, device)
 
 sampling_descri = [ 
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
-    "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy."
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests.",
+    "A chair with a backrest and armrests."
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy",
+    # "A modern, minimalist office chair with a sleek, curved backrest, and a slim, low-profile armrest. a streamlined, monochromatic design, minimalist aesthetic. a lightweight, yet sturdy."
 ] 
 
 def generate_samples(model, epoch, sampling_method, device):
     # 生成样本示例
     model.eval()
     with torch.no_grad():
-        # 此处 y 可以视情况设定，例如全 0 表示某一类别
         y_gen = sampling_descri
         sample_shape = (len(y_gen), 3, DATA_POINTS_IN_MODEL_SIZE)  # 假设点云3通道
         if sampling_method == "ddpm":

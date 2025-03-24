@@ -6,12 +6,17 @@ import json
 
 from datasets.data_preprocessing import ShapeNet15kPointClouds
 import visualize
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data
+from models.dit3d_window_attn import DiT3D_models_WindAttn
 
 DATASET_PATH = "datasets/shapenet_data_5000_splitted"
 RESULTS_JSON_PATH = "datasets/results.json"
 def get_sampling_path(epoch): 
     return f"output/generated_samples_epoch{epoch}.npy"
 DATA_POINTS_SIZE = 5000
+DDIM_SAMPLE_STEPS=1000
 DATA_POINTS_IN_MODEL_SIZE = 3500
 CATEGORY = ['chair']
 BATCH_SIZE = 8
@@ -26,23 +31,18 @@ beta_end = 0.008
 time_num = 1000
 iteration_num = 10000
 checkpoints_dir = "checkpoints"
-DDIM_SAMPLE_STEPS=50
+
 
 sampling_descri = [ 
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
-    "A wooden chair with a curved backrest, four legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
+    "A chair with a armrest, legs",
 ]
-
-import torch.nn as nn
-import torch.optim as optim
-import torch.utils.data
-from models.dit3d_window_attn import DiT3D_models_WindAttn
 
 class Model(nn.Module):
     def __init__(self, diffusion, base_model):
@@ -209,50 +209,34 @@ class GaussianDiffusion:
         return losses
 
     def ddim_sample(self, denoise_fn, x_t, t, y, eta=0.2, clip_denoised=True):
-        """
-        DDIM 单步采样更新
-        eta：控制随机性，eta=0时为确定性采样
-        """
-        # 预测噪声
         eps = denoise_fn(x_t, t, y)
-        # 提取当前时间步的 alpha_bar
         alpha_bar = self._extract(self.alphas_cumprod.to(x_t.device), t, x_t.shape)
         sqrt_alpha_bar = torch.sqrt(alpha_bar)
         sqrt_one_minus_alpha_bar = torch.sqrt(1 - alpha_bar)
-        # 根据公式预测 x0
         x0_pred = (x_t - sqrt_one_minus_alpha_bar * eps) / sqrt_alpha_bar
         if clip_denoised:
             x0_pred = torch.clamp(x0_pred, -0.5, 0.5)
-        # 提取上一步的 alpha_bar，即 alpha_bar_{t-1}
         alpha_bar_prev = self._extract(self.alphas_cumprod_prev.to(x_t.device), t, x_t.shape)
-        # 计算 DDIM 更新中的 sigma
         sigma = eta * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar) * (1 - alpha_bar / alpha_bar_prev))
-        # 当 eta = 0 时噪声项为 0，实现确定性采样
         noise = torch.randn_like(x_t) if eta > 0 else 0.
-        # DDIM 更新公式
         x_t_prev = torch.sqrt(alpha_bar_prev) * x0_pred + \
                    torch.sqrt(1 - alpha_bar_prev - sigma**2) * eps + \
                    sigma * noise
         return x_t_prev
 
     def ddim_sample_loop(self, denoise_fn, shape, device, y, eta=0.0, clip_denoised=True):
-        """
-        DDIM 多步采样
-        """
         x = torch.randn(shape, dtype=torch.float, device=device)
-        for t in reversed(range(DDIM_SAMPLE_STEPS)):
+        for t in reversed(range(self.num_timesteps)):
             t_tensor = torch.full((shape[0],), t, dtype=torch.int64, device=device)
             x = self.ddim_sample(denoise_fn, x, t_tensor, y, eta, clip_denoised)
         return x
 
 def generate_samples(model, sampling_method, device):
-    # 生成样本示例
     model.eval()
     with torch.no_grad():
-        # 此处 y 可以视情况设定，例如全 0 表示某一类别
         y_gen = sampling_descri
         print("len",len(y_gen))
-        sample_shape = (len(y_gen), 3, DATA_POINTS_IN_MODEL_SIZE)  # 假设点云3通道
+        sample_shape = (len(y_gen), 3, DATA_POINTS_IN_MODEL_SIZE)
         if sampling_method == "ddpm":
             samples = model.gen_samples(sample_shape, device, y_gen, noise_fn=torch.randn, clip_denoised=False)
             print("Generated samples shape:", samples.shape)
@@ -263,21 +247,17 @@ def generate_samples(model, sampling_method, device):
             raise ValueError(f"Unknown sampling method: {sampling_method}")
         np.save("output/generated_samples_temp.npy", samples.cpu().numpy())
 
-        # # 生成采样轨迹（可用于观察生成过程）
         # traj = model.gen_sample_traj(sample_shape, device, y_gen, freq=40, noise_fn=torch.randn, clip_denoised=False)
         # print("Generated sample trajectory length:", len(traj))
 
 def main(sampling_method):
-    # 设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
-    # 生成 beta schedule（用于扩散过程）
-    betas = np.linspace(beta_start, beta_end, time_num)
+    betas = np.linspace(beta_start, beta_end, time_num if sampling_method =="ddpm" else DDIM_SAMPLE_STEPS)
     diffusion = GaussianDiffusion(betas, loss_type='mse', model_mean_type='eps', model_var_type='fixedsmall')
-    # 选择模型
     model_type = get_dit3d_model()
     model = Model(diffusion, model_type).to(device)
     generate_samples(model, sampling_method, device)
 
 if __name__ == "__main__":
-    main(sampling_method = "ddim")
+    main(sampling_method = "ddpm")
